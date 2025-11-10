@@ -365,7 +365,7 @@ void cns_t::rhsArtDiff(deviceMemory<dfloat>& o_Q, deviceMemory<dfloat>& o_RHS, c
   gradTraceHalo.ExchangeStart(o_gradq, 1);
 
 
-  applyStab(o_Q, o_gradq, T);
+  // applyStab(o_Q, o_gradq, T);
    // const dfloat vmax = 0.0; 
    // platform.linAlg().scale(mesh.Nelements*mesh.Np, vmax, o_viscosity); 
 

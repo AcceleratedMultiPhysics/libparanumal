@@ -26,6 +26,7 @@ SOFTWARE.
 
 #include "core.hpp"
 #include "timeStepper.hpp"
+#include "timer.hpp"
 
 namespace libp {
 
@@ -133,14 +134,16 @@ void dopri5::Run(solver_t& solver,
 
   solver.Report(time,0);
 
-  dfloat outputInterval=0.0;
-  solver.settings.getSetting("OUTPUT INTERVAL", outputInterval);
+  // dfloat outputInterval=0.0;
+  // solver.settings.getSetting("OUTPUT INTERVAL", outputInterval);
 
-  dfloat outputTime = time + outputInterval;
+  // dfloat outputTime = time + outputInterval;
 
   int tstep=0, allStep=0;
 
-  while (time < end) {
+  timePoint_t startSimulation = GlobalPlatformTime(platform);
+
+  while (tstep < 1000) {
 
     LIBP_ABORT("Time step became too small at time step = " << tstep,
                dt<dtMIN);
@@ -168,56 +171,56 @@ void dopri5::Run(solver_t& solver,
 
     if (err<1.0) { //dt is accepted
 
-      // check for output during this step and do a mini-step
-      if (time<outputTime && time+dt>=outputTime) {
-        dfloat savedt = dt;
+      // // check for output during this step and do a mini-step
+      // if (time<outputTime && time+dt>=outputTime) {
+      //   dfloat savedt = dt;
 
-        // save rkq
-        deviceMemory<dfloat> o_saveq = platform.reserve<dfloat>(N);
-        deviceMemory<dfloat> o_savepmlq  = platform.reserve<dfloat>(Npml);
-        o_saveq.copyFrom(o_rkq, N, 0, properties_t("async", true));
-        if (o_pmlq.has_value()) {
-          o_savepmlq.copyFrom(o_rkpmlq, Npml, 0, properties_t("async", true));
-        }
+      //   // save rkq
+      //   deviceMemory<dfloat> o_saveq = platform.reserve<dfloat>(N);
+      //   deviceMemory<dfloat> o_savepmlq  = platform.reserve<dfloat>(Npml);
+      //   o_saveq.copyFrom(o_rkq, N, 0, properties_t("async", true));
+      //   if (o_pmlq.has_value()) {
+      //     o_savepmlq.copyFrom(o_rkpmlq, Npml, 0, properties_t("async", true));
+      //   }
 
-        // change dt to match output
-        dt = outputTime-time;
+      //   // change dt to match output
+      //   dt = outputTime-time;
 
-        // time step to output
-        Step(solver, o_q, o_pmlq,
-             o_rkq, o_rkpmlq, o_rkerr,
-             time, dt);
+      //   // time step to output
+      //   Step(solver, o_q, o_pmlq,
+      //        o_rkq, o_rkpmlq, o_rkerr,
+      //        time, dt);
 
-        // shift for output
-        o_rkq.copyTo(o_q, N, 0, properties_t("async", true));
-        if (o_pmlq.has_value()) {
-          o_rkpmlq.copyTo(o_pmlq.value(), Npml, 0, properties_t("async", true));
-        }
+      //   // shift for output
+      //   o_rkq.copyTo(o_q, N, 0, properties_t("async", true));
+      //   if (o_pmlq.has_value()) {
+      //     o_rkpmlq.copyTo(o_pmlq.value(), Npml, 0, properties_t("async", true));
+      //   }
 
-        // output  (print from rkq)
-        solver.Report(outputTime,tstep);
+      //   // output  (print from rkq)
+      //   solver.Report(outputTime,tstep);
 
-        // restore time step
-        dt = savedt;
+      //   // restore time step
+      //   dt = savedt;
 
-        // increment next output time
-        outputTime += outputInterval;
+      //   // increment next output time
+      //   outputTime += outputInterval;
 
-        // accept saved rkq
-        o_saveq.copyTo(o_q, N, 0, properties_t("async", true));
-        if (o_pmlq.has_value()) {
-          o_savepmlq.copyTo(o_pmlq.value(), Npml, 0, properties_t("async", true));
-        }
-      } else {
+      //   // accept saved rkq
+      //   o_saveq.copyTo(o_q, N, 0, properties_t("async", true));
+      //   if (o_pmlq.has_value()) {
+      //     o_savepmlq.copyTo(o_pmlq.value(), Npml, 0, properties_t("async", true));
+      //   }
+      // } else {
         // accept rkq
         o_q.copyFrom(o_rkq, N, 0, properties_t("async", true));
         if (o_pmlq.has_value()) {
           o_pmlq.value().copyFrom(o_rkpmlq, Npml, 0, properties_t("async", true));
         }
-      }
+      // }
 
       time += dt;
-      while (time>outputTime) outputTime+= outputInterval; //catch up next output in case dt>outputInterval
+      // while (time>outputTime) outputTime+= outputInterval; //catch up next output in case dt>outputInterval
 
       constexpr dfloat errMax = 1.0e-4;  // hard coded factor ?
       facold = std::max(err,errMax);
@@ -229,6 +232,10 @@ void dopri5::Run(solver_t& solver,
     dt = dtnew;
     allStep++;
   }
+timePoint_t endSimulation = GlobalPlatformTime(platform);
+dfloat elapsed = ElapsedTime(startSimulation,endSimulation);
+
+printf("Elapsed Time: %lf\n", elapsed);
 }
 
 

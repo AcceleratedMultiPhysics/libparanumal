@@ -26,6 +26,7 @@ SOFTWARE.
 
 #include "core.hpp"
 #include "timeStepper.hpp"
+#include "timer.hpp"
 
 namespace libp {
 
@@ -104,33 +105,37 @@ void lserk4::Run(solver_t& solver,
 
   int tstep=0;
   dfloat stepdt;
-  while (time < end) {
 
-    if (time<outputTime && time+dt>=outputTime) {
-      //save current state
-      deviceMemory<dfloat> o_saveq = platform.reserve<dfloat>(N);
-      deviceMemory<dfloat> o_savepmlq  = platform.reserve<dfloat>(Npml);
-      o_saveq.copyFrom(o_q, N, 0, properties_t("async", true));
-      if (o_pmlq.has_value()) {
-        o_savepmlq.copyFrom(o_pmlq.value(), Npml, 0, properties_t("async", true));
-      }
+  timePoint_t startSimulation = GlobalPlatformTime(platform);
 
-      stepdt = outputTime-time;
+  // while (time < end) {
+  while (tstep < 1000) {
 
-      //take small time step
-      Step(solver, o_q, o_pmlq, time, stepdt);
+    // if (time<outputTime && time+dt>=outputTime) {
+    //   //save current state
+    //   deviceMemory<dfloat> o_saveq = platform.reserve<dfloat>(N);
+    //   deviceMemory<dfloat> o_savepmlq  = platform.reserve<dfloat>(Npml);
+    //   o_saveq.copyFrom(o_q, N, 0, properties_t("async", true));
+    //   if (o_pmlq.has_value()) {
+    //     o_savepmlq.copyFrom(o_pmlq.value(), Npml, 0, properties_t("async", true));
+    //   }
 
-      //report state
-      solver.Report(outputTime,tstep);
+    //   stepdt = outputTime-time;
 
-      //restore previous state
-      o_q.copyFrom(o_saveq, N, 0, properties_t("async", true));
-      if (o_pmlq.has_value()) {
-        o_pmlq.value().copyFrom(o_savepmlq, Npml, 0, properties_t("async", true));
-      }
+    //   //take small time step
+    //   Step(solver, o_q, o_pmlq, time, stepdt);
 
-      outputTime += outputInterval;
-    }
+    //   //report state
+    //   solver.Report(outputTime,tstep);
+
+    //   //restore previous state
+    //   o_q.copyFrom(o_saveq, N, 0, properties_t("async", true));
+    //   if (o_pmlq.has_value()) {
+    //     o_pmlq.value().copyFrom(o_savepmlq, Npml, 0, properties_t("async", true));
+    //   }
+
+    //   outputTime += outputInterval;
+    // }
 
     //check for final timestep
     if (time+dt > end){
@@ -143,6 +148,11 @@ void lserk4::Run(solver_t& solver,
     time += stepdt;
     tstep++;
   }
+
+  timePoint_t endSimulation = GlobalPlatformTime(platform);
+  dfloat elapsed = ElapsedTime(startSimulation,endSimulation);
+
+  printf("Elapsed Time: %lf\n", elapsed);
 }
 
 void lserk4::Step(solver_t& solver,
