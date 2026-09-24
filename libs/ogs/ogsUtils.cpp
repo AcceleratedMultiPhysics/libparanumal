@@ -56,7 +56,12 @@ void InitializeKernels(platform_t& platform, const Type type, const Op op) {
     switch (type) {
       case Float:  kernelInfo["defines/T"] =  "float"; break;
       case Double: kernelInfo["defines/T"] =  "double"; break;
-      case Int32:  kernelInfo["defines/T"] =  "int32_t"; break;
+      case Int32:
+        // OKL parses kernel types before C/C++ system typedefs are available.
+        // Use the native spelling for the 32-bit integer halo payload.
+        static_assert(std::is_same<int32_t,int>::value, "OGS Int32 requires a 32-bit int");
+        kernelInfo["defines/T"] = "int";
+        break;
       case Int64:  kernelInfo["defines/T"] =  "int64_t"; break;
     }
 

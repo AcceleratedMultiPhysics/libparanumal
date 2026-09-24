@@ -38,6 +38,8 @@ SOFTWARE.
 
 using namespace libp;
 
+class bnsHcz_t;
+
 class bnsSettings_t: public settings_t {
 public:
   bnsSettings_t(comm_t& _comm);
@@ -49,6 +51,23 @@ public:
 
 class bns_t: public solver_t {
 public:
+  std::shared_ptr<bnsHcz_t> hcz;
+  void HczSetup();
+  void HczRun();
+  void HczReport(dfloat time, int tstep);
+  dfloat sark4MaxTimeStep(const dfloat time) override;
+  void sark4Tolerances(dfloat& atol, dfloat& rtol) override;
+  bool sark4Admissible(deviceMemory<dfloat>& o_q, const dfloat time) override;
+  void sark4StartStep(deviceMemory<dfloat>& o_q, const dfloat time, const dfloat dt) override;
+  Sark4StageStatus sark4CheckStage(deviceMemory<dfloat>& o_q, const dfloat time, const int stage) override;
+  bool sark4Rhs(deviceMemory<dfloat>& o_q, deviceMemory<dfloat>& o_rhs, const dfloat time) override;
+  void sark4SaveOutputState() override;
+  void sark4RestoreOutputState() override;
+  void rhsf(deviceMemory<dfloat>& o_Q, deviceMemory<dfloat>& o_RHS,
+            const dfloat T) override;
+  void rhsf_lserk4(deviceMemory<dfloat>& o_Q, deviceMemory<dfloat>& o_res,
+                  deviceMemory<dfloat>& o_RHS, const dfloat T,
+                  const dfloat dt, const dfloat a, const dfloat b) override;
   mesh_t mesh;
 
   int Nfields;
@@ -169,5 +188,3 @@ public:
   std::vector<dfloat> iso_nodes;
   std::vector<int> iso_tris;
 */
-
-

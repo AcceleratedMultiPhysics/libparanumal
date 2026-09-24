@@ -1,0 +1,86 @@
+/*
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2022 Tim Warburton, Noel Chalmers, Jesse Chan, Ali Karakus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+// Local nodal HCZ sources for kappa=0. No geometry factors or cubature
+// weights belong here: gradients already contain the central DG derivative.
+// q/rhsq: [element][12 moments][node].
+// gradients: [element][psiPhi_x, psiPhi_y, psiRho_x, psiRho_y][node].
+// Caller supplies finite states/gradients, c>0, a valid density map with
+// positive nodal rho, and kappa=0. Positive gravity acts in negative y.
+#if p_Nfields != 12
+#error HCZ Quad2D sources require twelve fields
+#endif
+
+@kernel void bnsHczSourceQuad2D(const dlong Nelements,
+                               @restrict const dlong *elementIds,
+                               const dfloat c,
+                               const dfloat gravity,
+                               const dfloat rhoL,
+                               const dfloat rhoH,
+                               const dfloat phiL,
+                               const dfloat phiH,
+                               @restrict const dfloat *q,
+                               @restrict const dfloat *gradients,
+                               @restrict dfloat *rhsq){
+  for(dlong eo=0;eo<Nelements;eo+=p_NblockV;@outer(0)){
+    for(int es=0;es<p_NblockV;++es;@inner(2)){
+      for(int j=0;j<p_Nq;++j;@inner(1)){
+        for(int i=0;i<p_Nq;++i;@inner(0)){
+          const dlong et = eo+es;
+          if(et<Nelements){
+            const dlong e = elementIds[et];
+            const int node = j*p_Nq+i;
+            const dlong base = e*p_Nfields*p_Np+node;
+            const dlong gradBase = e*4*p_Np+node;
+            const dfloat phi = q[base];
+            const dfloat rho = rhoL+(phi-phiL)*(rhoH-rhoL)/(phiH-phiL);
+            const dfloat u = q[base+7*p_Np]/(rho*c);
+            const dfloat v = q[base+8*p_Np]/(rho*c);
+            const dfloat c2 = c*c;
+            const dfloat px = gradients[gradBase];
+            const dfloat py = gradients[gradBase+p_Np];
+            const dfloat rx = gradients[gradBase+2*p_Np];
+            const dfloat ry = gradients[gradBase+3*p_Np];
+            const dfloat fy = -rho*gravity;
+
+            rhsq[base+1*p_Np] += -px/c;
+            rhsq[base+2*p_Np] += -py/c;
+            rhsq[base+3*p_Np] += -(u*py+v*px)/c2;
+            rhsq[base+4*p_Np] += -sqrt(2.0)*u*px/c2;
+            rhsq[base+5*p_Np] += -sqrt(2.0)*v*py/c2;
+            rhsq[base+6*p_Np] += -(u*rx+v*ry);
+            rhsq[base+8*p_Np] += c*fy;
+            rhsq[base+9*p_Np] += u*(fy-ry)-v*rx;
+            rhsq[base+10*p_Np] += -sqrt(2.0)*u*rx;
+            rhsq[base+11*p_Np] += sqrt(2.0)*v*(fy-ry);
+            // Index source (field 0) is zero. With kappa=0, Fx=0, so
+            // field 7 also receives no source. Preserve their existing RHS.
+          }
+        }
+      }
+    }
+  }
+}

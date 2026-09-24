@@ -1,0 +1,131 @@
+/*
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2022 Tim Warburton, Noel Chalmers, Jesse Chan, Ali Karakus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+// Conservative mixed DG/subcell face correction matching hybrid().
+// q/rhs: [element][12 moments][DG node]. mask: binary [element], with halos.
+// faces: [element][axis][12 moments][subcell tangent][normal face].
+// R[i+s*p_Nq] maps subcell tangents to DG face nodes. weights are 1D GLL.
+// Caller supplies current DG/mask halos and WENO faces for owned DG neighbors.
+#if p_Nfields != 12 || p_Nq < 2
+#error HCZ mixed faces require twelve fields and degree at least one
+#endif
+#define p_Nsubq (2*p_Nq-1)
+
+void hczMixedUpwind(const dfloat *l,const dfloat *r,const int axis,
+                    const dfloat c,dfloat *flux){
+  const dfloat sq2=1.4142135623730950488,sq3=1.7320508075688772935;
+  dfloat d[12],z[12],fl[12],fr[12];
+  for(int k=0;k<12;++k){d[k]=r[k]-l[k];z[k]=0.0;fl[k]=0.0;fr[k]=0.0;}
+  for(int s=0;s<12;s+=6){
+    const int u=s+1+axis,stress=s+4+axis,v=s+2-axis;
+    z[s]=(d[s]+sq2*d[stress])/sq3;z[u]=sq3*d[u];
+    z[stress]=(sq2*d[s]+2*d[stress])/sq3;z[v]=d[v];z[s+3]=d[s+3];
+    if(axis==0){
+      fl[s]=c*l[s+1];fl[s+1]=c*(l[s]+sq2*l[s+4]);fl[s+2]=c*l[s+3];fl[s+3]=c*l[s+2];fl[s+4]=sq2*c*l[s+1];
+      fr[s]=c*r[s+1];fr[s+1]=c*(r[s]+sq2*r[s+4]);fr[s+2]=c*r[s+3];fr[s+3]=c*r[s+2];fr[s+4]=sq2*c*r[s+1];
+    }else{
+      fl[s]=c*l[s+2];fl[s+1]=c*l[s+3];fl[s+2]=c*(l[s]+sq2*l[s+5]);fl[s+3]=c*l[s+1];fl[s+5]=sq2*c*l[s+2];
+      fr[s]=c*r[s+2];fr[s+1]=c*r[s+3];fr[s+2]=c*(r[s]+sq2*r[s+5]);fr[s+3]=c*r[s+1];fr[s+5]=sq2*c*r[s+2];
+    }
+  }
+  for(int k=0;k<12;++k)flux[k]=.5*(fl[k]+fr[k]-c*z[k]);
+}
+
+@kernel void bnsHczMixedSurfaceQuad2D(const dlong Nelements,
+                                      @restrict const dlong *elementIds,
+                                      @restrict const dlong *neighbors,
+                                      @restrict const int *mask,
+                                      @restrict const dfloat *R,
+                                      @restrict const dfloat *weights,
+                                      const dfloat c,const dfloat hx,const dfloat hy,
+                                      @restrict const dfloat *q,
+                                      @restrict const dfloat *faces,
+                                      @restrict dfloat *rhs){
+  for(dlong et=0;et<Nelements;++et;@outer(0)){
+    @shared int s_active[4];
+    @shared dfloat s_R[p_Nq][p_Nsubq],s_w[p_Nq];
+    @shared dfloat s_nf[4][12][p_Nq],s_avg[4][12],s_dgAvg[4][12];
+    for(int lane=0;lane<128;++lane;@inner(0)){
+      const dlong e=elementIds[et];
+      for(int a=lane;a<p_Nq*p_Nsubq;a+=128)s_R[a%p_Nq][a/p_Nq]=R[a];
+      for(int a=lane;a<p_Nq;a+=128)s_w[a]=weights[a];
+      if(lane<4){
+        const int axis=lane/2,sign=lane%2?1:-1;
+        const dlong nb=neighbors[9*e+4+sign*(axis?3:1)];
+        s_active[lane]=mask[e]==0 && nb>=0 && mask[nb]!=0;
+      }
+    }
+    for(int lane=0;lane<128;++lane;@inner(0)){
+      for(int a=lane;a<4*12*p_Nq;a+=128){
+        const int face=a/(12*p_Nq),k=(a/p_Nq)%12,t=a%p_Nq;
+        if(s_active[face]){
+          const int axis=face/2,normal=face%2?p_Nsubq:0;
+          const dlong base=((elementIds[et]*2+axis)*12+k)*p_Nsubq*(p_Nsubq+1)+normal;
+          dfloat value=0.0;
+          for(int s=0;s<p_Nsubq;++s)value+=s_R[t][s]*faces[base+s*(p_Nsubq+1)];
+          s_nf[face][k][t]=value;
+        }
+      }
+    }
+    for(int lane=0;lane<128;++lane;@inner(0)){
+      if(lane<48){
+        const int face=lane/12,k=lane%12;
+        if(s_active[face]){
+          const int axis=face/2,normal=face%2?p_Nsubq:0;
+          const dlong base=((elementIds[et]*2+axis)*12+k)*p_Nsubq*(p_Nsubq+1)+normal;
+          dfloat avg=0.0,dg=0.0;
+          for(int s=0;s<p_Nsubq;++s)avg+=faces[base+s*(p_Nsubq+1)]/p_Nsubq;
+          for(int t=0;t<p_Nq;++t)dg+=.5*s_w[t]*s_nf[face][k][t];
+          s_avg[face][k]=avg;s_dgAvg[face][k]=dg;
+        }
+      }
+    }
+    for(int lane=0;lane<128;++lane;@inner(0)){
+      for(int node=lane;node<p_Np;node+=128){
+        const dlong e=elementIds[et];
+        const int i=node%p_Nq,j=node/p_Nq;
+        // A thread owns each DG node and applies x-,x+,y-,y+ in host order.
+        for(int face=0;face<4;++face){
+          const int axis=face/2,sign=face%2?1:-1,a=sign<0?0:p_Nq-1;
+          if(s_active[face] && (axis?j:i)==a){
+            const int t=axis?i:j;
+            const dlong nb=neighbors[9*e+4+sign*(axis?3:1)];
+            const int otherNode=axis?(p_Nq-1-a)*p_Nq+i:j*p_Nq+p_Nq-1-a;
+            dfloat l[12],r[12],old[12];
+            for(int k=0;k<12;++k){
+              const dfloat own=q[(e*12+k)*p_Np+node],other=q[(nb*12+k)*p_Np+otherNode];
+              l[k]=sign>0?own:other;r[k]=sign>0?other:own;
+            }
+            hczMixedUpwind(l,r,axis,c,old);
+            for(int k=0;k<12;++k)
+              rhs[(e*12+k)*p_Np+node]-=2.0/(axis?hy:hx)*sign/s_w[a]
+                *(s_nf[face][k][t]+s_avg[face][k]-s_dgAvg[face][k]-old[k]);
+          }
+        }
+      }
+    }
+  }
+}

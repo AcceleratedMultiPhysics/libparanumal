@@ -1,0 +1,134 @@
+/*
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2022 Tim Warburton, Noel Chalmers, Jesse Chan, Ali Karakus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+// Read-only input/candidate checks matching QuadOperator::admissible.
+// q, residual, rhs: [element][12 moments][node]. flags is packed by elementIds.
+// Bit 1: invalid nodal state; bit 2: invalid cubature state.
+#if p_Nfields != 12
+#error HCZ admissibility requires twelve fields
+#endif
+
+@kernel void bnsHczAdmissibilityQuad2D(const dlong Nelements,
+                                      @restrict const dlong *elementIds,
+                                      @restrict const dfloat *cubInterp,
+                                      const int candidate,
+                                      const dfloat dt,
+                                      const dfloat rkA,
+                                      const dfloat rkB,
+                                      const dfloat rhoL,
+                                      const dfloat rhoH,
+                                      const dfloat phiL,
+                                      const dfloat phiH,
+                                      const dfloat eosB,
+                                      const dfloat phiFloor,
+                                      @restrict const dfloat *q,
+                                      @restrict const dfloat *residual,
+                                      @restrict const dfloat *rhs,
+                                      @restrict int *flags){
+  for(dlong et=0;et<Nelements;++et;@outer(0)){
+    @shared dfloat s_q[12][p_Nq][p_Nq];
+    @shared dfloat s_I[p_cubNq][p_Nq];
+    @shared int s_bad[p_cubNq][p_cubNq];
+
+    for(int j=0;j<p_cubNq;++j;@inner(1)){
+      for(int i=0;i<p_cubNq;++i;@inner(0)){
+        int bad = 0;
+        if(i<p_Nq)s_I[j][i] = cubInterp[j+i*p_cubNq];
+        if(i<p_Nq && j<p_Nq){
+          const dlong base = elementIds[et]*12*p_Np+j*p_Nq+i;
+          for(int k=0;k<12;++k){
+            dfloat value = q[base+k*p_Np];
+            if(candidate){
+              dfloat increment = dt*rhs[base+k*p_Np];
+              // The first LSERK4 residual is uninitialized and must not be read.
+              if(rkA!=0.0)increment += rkA*residual[base+k*p_Np];
+              value += rkB*increment;
+            }
+            s_q[k][j][i] = value;
+            if(!isfinite(value))bad = 1;
+          }
+          const dfloat phi = s_q[0][j][i];
+          const dfloat rho = rhoL+(phi-phiL)*(rhoH-rhoL)/(phiH-phiL);
+          if(!(phi>phiFloor) || !(rho>0.0) || !(eosB*phi<3.999))bad = 1;
+        }
+        s_bad[j][i] = bad;
+      }
+    }
+
+    for(int j=0;j<p_cubNq;++j;@inner(1)){
+      for(int i=0;i<p_cubNq;++i;@inner(0)){
+        int bad = s_bad[j][i];
+        // Keep the reference's full tensor contraction and summation order.
+        // This check does not modify or store a full candidate state globally.
+        for(int k=0;k<12;++k){
+          dfloat value = 0.0;
+          for(int a=0;a<p_Nq;++a)
+            for(int b=0;b<p_Nq;++b)
+              value += s_I[j][a]*s_I[i][b]*s_q[k][a][b];
+          if(!isfinite(value))bad |= 2;
+          if(k==0){
+            const dfloat rho = rhoL+(value-phiL)*(rhoH-rhoL)/(phiH-phiL);
+            if(!(rho>0.0))bad |= 2;
+          }
+        }
+        s_bad[j][i] = bad;
+      }
+    }
+
+    for(int j=0;j<p_cubNq;++j;@inner(1)){
+      for(int i=0;i<p_cubNq;++i;@inner(0)){
+        if(i==0 && j==0){
+          int bad = 0;
+          for(int a=0;a<p_cubNq;++a)
+            for(int b=0;b<p_cubNq;++b)bad |= s_bad[a][b];
+          flags[et] = bad;
+        }
+      }
+    }
+  }
+}
+
+// One workgroup reduces all element flags to one integer, including N=0.
+@kernel void bnsHczAdmissibilityReduce(const dlong Nelements,
+                                      @restrict const int *flags,
+                                      @restrict int *result){
+  for(int block=0;block<1;++block;@outer(0)){
+    @shared int s_bad[256];
+    for(int i=0;i<256;++i;@inner(0)){
+      int bad = 0;
+      for(dlong e=i;e<Nelements;e+=256)bad |= flags[e];
+      s_bad[i] = bad;
+    }
+    for(int offset=128;offset>0;offset/=2){
+      for(int i=0;i<256;++i;@inner(0)){
+        if(i<offset)s_bad[i] |= s_bad[i+offset];
+      }
+    }
+    for(int i=0;i<256;++i;@inner(0)){
+      if(i==0)result[0] = s_bad[0];
+    }
+  }
+}

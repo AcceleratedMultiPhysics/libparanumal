@@ -1,0 +1,87 @@
+/*
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2022 Tim Warburton, Noel Chalmers, Jesse Chan, Ali Karakus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+// Initialize the HCZ subcell residual with pointwise BGK minus WENO flux
+// divergence, matching hybrid() before addSources(). Cartesian quads only.
+// sub/rhs: [element][12 moments][y subcell][x subcell].
+// faces: [element][axis][12 moments][tangent subcell][normal face].
+// Caller supplies finite prepared states/faces, positive mapped density,
+// c, tauPhi, tauG, hx, hy, and valid density-map endpoints.
+#if p_Nfields != 12
+#error HCZ subcell residual requires twelve fields
+#endif
+#if p_Nq < 2
+#error HCZ subcell residual requires polynomial degree at least one
+#endif
+#define p_Nsubq (2*p_Nq-1)
+#define p_Nsubp (p_Nsubq*p_Nsubq)
+
+@kernel void bnsHczSubcellRhsQuad2D(const dlong Nelements,
+                                   @restrict const dlong *elementIds,
+                                   const dfloat c,
+                                   const dfloat tauPhi,
+                                   const dfloat tauG,
+                                   const dfloat rhoL,
+                                   const dfloat rhoH,
+                                   const dfloat phiL,
+                                   const dfloat phiH,
+                                   const dfloat hx,
+                                   const dfloat hy,
+                                   @restrict const dfloat *sub,
+                                   @restrict const dfloat *faces,
+                                   @restrict dfloat *rhs){
+  for(dlong et=0;et<Nelements;++et;@outer(0)){
+    for(int lane=0;lane<128;++lane;@inner(0)){
+      for(int node=lane;node<p_Nsubp;node+=128){
+        const dlong e=elementIds[et];
+        const int i=node%p_Nsubq,j=node/p_Nsubq;
+        const dlong base=e*12*p_Nsubp+node;
+        dfloat q[12],eq[12];
+        for(int k=0;k<12;++k)q[k]=sub[base+k*p_Nsubp];
+        const dfloat phi=q[0];
+        const dfloat rho=rhoL+(phi-phiL)*(rhoH-rhoL)/(phiH-phiL);
+        const dfloat u=q[7]/(rho*c),v=q[8]/(rho*c);
+        const dfloat sq2=1.4142135623730950488;
+        eq[0]=phi;
+        eq[1]=phi*u/c;eq[2]=phi*v/c;
+        eq[3]=phi*u*v/(c*c);
+        eq[4]=phi*u*u/(sq2*c*c);eq[5]=phi*v*v/(sq2*c*c);
+        eq[6]=q[6];eq[7]=q[7];eq[8]=q[8];
+        eq[9]=rho*u*v;eq[10]=rho*u*u/sq2;eq[11]=rho*v*v/sq2;
+        for(int k=0;k<12;++k){
+          dfloat collision=0.0;
+          if(k!=0 && k!=6 && k!=7 && k!=8)
+            collision=(eq[k]-q[k])/(k<6?tauPhi:tauG);
+          const dlong fx=((e*2*12+k)*p_Nsubq+j)*(p_Nsubq+1)+i;
+          const dlong fy=(((e*2+1)*12+k)*p_Nsubq+i)*(p_Nsubq+1)+j;
+          rhs[base+k*p_Nsubp]=collision
+            -(faces[fx+1]-faces[fx])/(hx/p_Nsubq)
+            -(faces[fy+1]-faces[fy])/(hy/p_Nsubq);
+        }
+      }
+    }
+  }
+}

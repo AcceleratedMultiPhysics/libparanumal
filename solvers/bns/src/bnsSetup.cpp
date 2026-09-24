@@ -34,6 +34,11 @@ void bns_t::Setup(platform_t& _platform, mesh_t& _mesh,
   comm = _mesh.comm;
   settings = _settings;
 
+  if (settings.compareSetting("BNS MODEL", "HCZ")) {
+    HczSetup();
+    return;
+  }
+
   //get physical paramters
   settings.getSetting("SPEED OF SOUND", c);
   settings.getSetting("VISCOSITY", nu);

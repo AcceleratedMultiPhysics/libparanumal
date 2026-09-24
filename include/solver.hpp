@@ -58,6 +58,45 @@ public:
     LIBP_FORCE_ABORT("rhsf not implemented in this solver");
   }
 
+  // Optional candidate-aware RHS for the existing low-storage RK update:
+  // res_new = a*res + dt*rhs; q_new = q + b*res_new.
+  // The callback must leave q and res unchanged. At a=0 res is uninitialized.
+  virtual void rhsf_lserk4(deviceMemory<dfloat>& o_q,
+                          deviceMemory<dfloat>& o_res,
+                          deviceMemory<dfloat>& o_rhs,
+                          const dfloat time, const dfloat dt,
+                          const dfloat a, const dfloat b) {
+    rhsf(o_q, o_rhs, time);
+  }
+
+  // Optional SARK4 controls. Defaults preserve other solvers' behavior.
+  // The admissibility decision and timestep limit must agree across ranks.
+  virtual dfloat sark4MaxTimeStep(const dfloat time) {
+    return std::numeric_limits<dfloat>::max();
+  }
+  virtual void sark4Tolerances(dfloat& atol, dfloat& rtol) {}
+  virtual bool sark4Admissible(deviceMemory<dfloat>& o_q, const dfloat time) {
+    return true;
+  }
+  enum class Sark4StageStatus {Accept, Restart, Reject};
+  // Begin a fresh timestep attempt (also called for output mini-steps).
+  virtual void sark4StartStep(deviceMemory<dfloat>& o_q, const dfloat time,
+                             const dfloat dt) {}
+  // Restart discards ALL stage residuals and replays from the original q.
+  // The solver must bound restarts and return the same status on every rank.
+  virtual Sark4StageStatus sark4CheckStage(deviceMemory<dfloat>& o_q,
+                                          const dfloat time, const int stage) {
+    return sark4Admissible(o_q,time)?Sark4StageStatus::Accept:Sark4StageStatus::Reject;
+  }
+  virtual bool sark4Rhs(deviceMemory<dfloat>& o_q, deviceMemory<dfloat>& o_rhs,
+                        const dfloat time) {
+    rhsf(o_q,o_rhs,time);return true;
+  }
+  // Preserve auxiliary reporting state while an output mini-step temporarily
+  // replaces an accepted full trial. Neither hook may change the solution.
+  virtual void sark4SaveOutputState() {}
+  virtual void sark4RestoreOutputState() {}
+
   // Partial rhs evaluation of f with solver in form dq/dt = f(q,t) + g(q,t)
   virtual void rhs_imex_f(deviceMemory<dfloat>& o_q, deviceMemory<dfloat>& o_rhs, const dfloat time) {
     LIBP_FORCE_ABORT("rhs_imex_f not implemented in this solver");

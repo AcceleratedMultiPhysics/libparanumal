@@ -28,6 +28,8 @@ SOFTWARE.
 
 void bns_t::Report(dfloat time, int tstep){
 
+  if (hcz) { HczReport(time, tstep); return; }
+
   static int frame=0;
 
   //compute q.M*q

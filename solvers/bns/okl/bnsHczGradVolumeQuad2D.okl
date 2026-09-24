@@ -1,0 +1,81 @@
+/*
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2022 Tim Warburton, Noel Chalmers, Jesse Chan, Ali Karakus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+// Central DG gradient, volume part. Potentials: [element][psiPhi, psiRho][node].
+// Gradients: [element][psiPhi_x, psiPhi_y, psiRho_x, psiRho_y][node].
+// This initializes selected gradient entries; the surface kernel adds to them.
+@kernel void bnsHczGradVolumeQuad2D(const dlong Nelements,
+                                   @restrict const dlong *elementIds,
+                                   @restrict const dfloat *vgeo,
+                                   @restrict const dfloat *DT,
+                                   @restrict const dfloat *potentials,
+                                   @restrict dfloat *gradients){
+  for(dlong eo=0;eo<Nelements;eo+=p_NblockV;@outer(0)){
+    @shared dfloat s_q[p_NblockV][2][p_Nq][p_Nq];
+    @shared dfloat s_DT[p_Nq][p_Nq];
+
+    for(int es=0;es<p_NblockV;++es;@inner(2)){
+      for(int j=0;j<p_Nq;++j;@inner(1)){
+        for(int i=0;i<p_Nq;++i;@inner(0)){
+          const dlong et = eo+es;
+          if(et<Nelements){
+            const dlong e = elementIds[et];
+            for(int fld=0;fld<2;++fld)
+              s_q[es][fld][j][i] = potentials[(e*2+fld)*p_Np+j*p_Nq+i];
+          }
+          if(es==0)s_DT[j][i] = DT[j*p_Nq+i];
+        }
+      }
+    }
+
+    for(int es=0;es<p_NblockV;++es;@inner(2)){
+      for(int j=0;j<p_Nq;++j;@inner(1)){
+        for(int i=0;i<p_Nq;++i;@inner(0)){
+          const dlong et = eo+es;
+          if(et<Nelements){
+            const dlong e = elementIds[et];
+            const dlong gid = e*p_Np*p_Nvgeo+j*p_Nq+i;
+            const dfloat rx = vgeo[gid+p_RXID*p_Np];
+            const dfloat ry = vgeo[gid+p_RYID*p_Np];
+            const dfloat sx = vgeo[gid+p_SXID*p_Np];
+            const dfloat sy = vgeo[gid+p_SYID*p_Np];
+            for(int fld=0;fld<2;++fld){
+              dfloat dr = 0.0, ds = 0.0;
+              #pragma unroll p_Nq
+              for(int m=0;m<p_Nq;++m){
+                dr += s_DT[i][m]*s_q[es][fld][j][m];
+                ds += s_DT[j][m]*s_q[es][fld][m][i];
+              }
+              const dlong base = (e*4+2*fld)*p_Np+j*p_Nq+i;
+              gradients[base] = rx*dr+sx*ds;
+              gradients[base+p_Np] = ry*dr+sy*ds;
+            }
+          }
+        }
+      }
+    }
+  }
+}

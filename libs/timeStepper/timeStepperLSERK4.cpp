@@ -165,7 +165,8 @@ void lserk4::Step(solver_t& solver,
     if (o_pmlq.has_value()) {
       solver.rhsf_pml(o_q, o_pmlq.value(), o_rhsq, o_rhspmlq, currentTime);
     } else {
-      solver.rhsf(o_q, o_rhsq, currentTime);
+      solver.rhsf_lserk4(o_q, o_resq, o_rhsq, currentTime,
+                        _dt, rka[rk], rkb[rk]);
     }
 
     // update solution using Runge-Kutta

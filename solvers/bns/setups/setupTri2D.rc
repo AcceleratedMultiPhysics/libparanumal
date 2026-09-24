@@ -5,7 +5,7 @@
 data/bnsGaussian2D.h
 
 [MESH FILE]
-PMLBOX
+BOX
 
 [MESH DIMENSION]
 2

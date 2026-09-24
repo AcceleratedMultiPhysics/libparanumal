@@ -28,6 +28,8 @@ SOFTWARE.
 
 void bns_t::Run(){
 
+  if (hcz) { HczRun(); return; }
+
   dfloat startTime, finalTime;
   settings.getSetting("START TIME", startTime);
   settings.getSetting("FINAL TIME", finalTime);
@@ -87,5 +89,4 @@ void bns_t::Run(){
       printf("Solution norm = %17.15lg\n", norm2);
   }
 }
-
 

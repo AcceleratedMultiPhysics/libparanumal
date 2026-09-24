@@ -27,7 +27,7 @@ SOFTWARE.
 // Initial conditions
 #define bnsInitialConditions2D(c, nu, t, x, y, r, u, v, s11, s12, s22) \
 {                                         \
-  *(r) = 1 + exp(-3*(x*x+y*y));           \
+  *(r) = 5 + exp(-3*(x*x+y*y));           \
   *(u) = exp(-3*(x*x+y*y));               \
   *(v) = exp(-3*(x*x+y*y));               \
   *(s11) = 0.0;                           \

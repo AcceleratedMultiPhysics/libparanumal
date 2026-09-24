@@ -1,0 +1,169 @@
+/*
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2022 Tim Warburton, Noel Chalmers, Jesse Chan, Ali Karakus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+// Cartesian HCZ WENO3-Z face fluxes, matching QuadOperator::wenoFace.
+// sub: [element][12 moments][y subcell][x subcell].
+// faces: [element][axis][12 moments][tangent subcell][normal face].
+// neighbors: [owned element][9], ordered (dy+1)*3+dx+1, including self.
+// All referenced owned/halo subcells must be prepared before this call.
+// x must be periodic; only physical y-wall neighbors may be negative.
+#if p_Nfields != 12
+#error HCZ WENO face fluxes require twelve fields
+#endif
+#if p_Nq < 2
+#error HCZ WENO face fluxes require polynomial degree at least one
+#endif
+#ifndef p_HCZ_CHARACTERISTIC_WENO
+#define p_HCZ_CHARACTERISTIC_WENO 1
+#endif
+#define p_Nsubq (2*p_Nq-1)
+#define p_Nsubp (p_Nsubq*p_Nsubq)
+#define p_NsubFaces (2*p_Nsubq*(p_Nsubq+1))
+
+dfloat hczWeno3zBlend(const dfloat v0,const dfloat v1,
+                     const dfloat b0,const dfloat b1,
+                     const dfloat d0,const dfloat epsilon){
+  const dfloat tau=fabs(b0-b1);
+  const dfloat z0=tau/(b0+epsilon),z1=tau/(b1+epsilon);
+  const dfloat a0=d0*(1.0+z0*z0);
+  const dfloat a1=(1.0-d0)*(1.0+z1*z1);
+  return (a0*v0+a1*v1)/(a0+a1);
+}
+
+@kernel void bnsHczWenoFaceQuad2D(const dlong Nelements,
+                                 @restrict const dlong *elementIds,
+                                 @restrict const dlong *neighbors,
+                                 const dfloat c,
+                                 const dfloat alpha,
+                                 const dfloat epsilon,
+                                 @restrict const dfloat *sub,
+                                 @restrict dfloat *faces){
+  for(dlong et=0;et<Nelements;++et;@outer(0)){
+    for(int lane=0;lane<128;++lane;@inner(0)){
+      for(int face=lane;face<p_NsubFaces;face+=128){
+        const dlong e=elementIds[et];
+        const int axis=face/(p_Nsubq*(p_Nsubq+1));
+        const int tangent=(face%(p_Nsubq*(p_Nsubq+1)))/(p_Nsubq+1);
+        const int normal=face%(p_Nsubq+1);
+        dfloat q[4][12];
+        // Face after normal-1: samples normal-2,...,normal+1.
+        // With N>=1, the two-layer stencil reaches only immediate neighbors.
+        for(int t=0;t<4;++t){
+          int i=axis?tangent:normal+t-2;
+          int j=axis?normal+t-2:tangent;
+          int dx=0,dy=0;
+          if(i<0){dx=-1;i+=p_Nsubq;}
+          else if(i>=p_Nsubq){dx=1;i-=p_Nsubq;}
+          if(j<0)dy=-1;
+          else if(j>=p_Nsubq)dy=1;
+          dlong other=neighbors[9*e+(dy+1)*3+dx+1];
+          const int wall=other<0;
+          if(wall){
+            other=neighbors[9*e+4+dx];
+            j=j<0?-j-1:2*p_Nsubq-1-j;
+          }else if(dy)j-=dy*p_Nsubq;
+          for(int k=0;k<12;++k){
+            dfloat value=sub[(other*12+k)*p_Nsubp+j*p_Nsubq+i];
+            if(wall && (k==1 || k==2 || k==7 || k==8))value=-value;
+            q[t][k]=value;
+          }
+        }
+        const dfloat sq2=1.4142135623730950488;
+#if p_HCZ_CHARACTERISTIC_WENO
+        const dfloat i2=0.7071067811865475244;
+        const dfloat i3=0.5773502691896257645;
+        const dfloat i6=0.4082482904638630164;
+        // Reconstruct only the four moving waves. The two stationary
+        // characteristics have exactly zero flux (no scalar LF penalty).
+        for(int family=0;family<12;family+=6){
+          dfloat f[4];
+          for(int wave=0;wave<4;++wave){
+            dfloat w[4];
+            for(int t=0;t<4;++t){
+              if(wave<2)
+                w[t]=i6*q[t][family]+(wave==0?i2:-i2)*q[t][family+1+axis]
+                     +i3*q[t][family+4+axis];
+              else
+                w[t]=i2*(q[t][family+2-axis]+(wave==2?1.0:-1.0)*q[t][family+3]);
+            }
+            const dfloat speed=c*(wave<2?1.7320508075688772935:1.0);
+            const dfloat d0=w[1]-w[0],d1=w[2]-w[1],d2=w[3]-w[2];
+            if(wave%2==0)
+              f[wave]=speed*hczWeno3zBlend(1.5*w[1]-.5*w[0],.5*(w[1]+w[2]),
+                                          d0*d0,d1*d1,1.0/3.0,epsilon);
+            else
+              f[wave]=-speed*hczWeno3zBlend(.5*(w[1]+w[2]),1.5*w[2]-.5*w[3],
+                                           d1*d1,d2*d2,2.0/3.0,epsilon);
+          }
+          dfloat out[6];
+          out[0]=i6*(f[0]+f[1]);
+          out[1+axis]=i2*(f[0]-f[1]);
+          out[4+axis]=i3*(f[0]+f[1]);
+          out[2-axis]=i2*(f[2]+f[3]);
+          out[3]=i2*(f[2]-f[3]);
+          out[5-axis]=0.0;
+          for(int k=0;k<6;++k){
+            const dlong output=(((e*2+axis)*12+family+k)*p_Nsubq+tangent)*(p_Nsubq+1)+normal;
+            faces[output]=out[k];
+          }
+        }
+#else
+        for(int k=0;k<12;++k){
+          const int family=(k/6)*6,moment=k%6;
+          dfloat fp[4],fm[4];
+          for(int t=0;t<4;++t){
+            dfloat flux=0.0;
+            if(axis==0){
+              if(moment==0)flux=c*q[t][family+1];
+              else if(moment==1)flux=c*(q[t][family]+sq2*q[t][family+4]);
+              else if(moment==2)flux=c*q[t][family+3];
+              else if(moment==3)flux=c*q[t][family+2];
+              else if(moment==4)flux=sq2*c*q[t][family+1];
+            }else{
+              if(moment==0)flux=c*q[t][family+2];
+              else if(moment==1)flux=c*q[t][family+3];
+              else if(moment==2)flux=c*(q[t][family]+sq2*q[t][family+5]);
+              else if(moment==3)flux=c*q[t][family+1];
+              else if(moment==5)flux=sq2*c*q[t][family+2];
+            }
+            fp[t]=.5*(flux+alpha*c*q[t][k]);
+            fm[t]=.5*(flux-alpha*c*q[t][k]);
+          }
+          const dfloat dp0=fp[1]-fp[0],dp1=fp[2]-fp[1];
+          const dfloat dm0=fm[2]-fm[1],dm1=fm[3]-fm[2];
+          const dfloat value=
+            hczWeno3zBlend(1.5*fp[1]-.5*fp[0],.5*(fp[1]+fp[2]),
+                          dp0*dp0,dp1*dp1,1.0/3.0,epsilon)
+           +hczWeno3zBlend(.5*(fm[1]+fm[2]),1.5*fm[2]-.5*fm[3],
+                          dm0*dm0,dm1*dm1,2.0/3.0,epsilon);
+          const dlong output=(((e*2+axis)*12+k)*p_Nsubq+tangent)*(p_Nsubq+1)+normal;
+          faces[output]=value;
+        }
+#endif
+      }
+    }
+  }
+}

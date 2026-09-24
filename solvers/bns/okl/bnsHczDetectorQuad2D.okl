@@ -1,0 +1,188 @@
+/*
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2022 Tim Warburton, Noel Chalmers, Jesse Chan, Ali Karakus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+// HCZ raw troubled-cell detector, matching QuadOperator::detect.
+// q/residual/rhs: [element][12 moments][node]. bounds: [element][min,max].
+// neighbors: [owned element][9], ordered (dy+1)*3+dx+1, including self.
+// Negative neighbors denote walls. Nonnegative entries can index halo bounds.
+// The caller must supply finite, admissible reference data and current bounds
+// for every referenced element, including diagonal halos.
+#if p_Nfields != 12
+#error HCZ detector requires twelve fields
+#endif
+
+@kernel void bnsHczIndexBoundsQuad2D(const dlong Nelements,
+                                     @restrict const dlong *elementIds,
+                                     @restrict const dfloat *q,
+                                     @restrict dfloat *bounds){
+  for(dlong et=0;et<Nelements;++et;@outer(0)){
+    @shared dfloat s_phi[p_Nq][p_Nq];
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        s_phi[j][i] = q[elementIds[et]*12*p_Np+j*p_Nq+i];
+      }
+    }
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        if(i==0 && j==0){
+          dfloat lo = s_phi[0][0], hi = lo;
+          for(int a=0;a<p_Nq;++a)for(int b=0;b<p_Nq;++b){
+            const dfloat phi = s_phi[a][b];
+            if(phi<lo)lo = phi;
+            if(phi>hi)hi = phi;
+          }
+          bounds[2*elementIds[et]] = lo;
+          bounds[2*elementIds[et]+1] = hi;
+        }
+      }
+    }
+  }
+}
+
+// Unbuffered interface seed from owned nodal bounds. A cell is selected if
+// its range intersects the open band (low, high), including a jump across it.
+@kernel void bnsHczInterfaceMaskQuad2D(const dlong Nelements,
+                                       @restrict const dlong *elementIds,
+                                       @restrict const dfloat *bounds,
+                                       const dfloat low,const dfloat high,
+                                       @restrict int *mask){
+  for(dlong block=0;block<(Nelements+255)/256;++block;@outer(0)){
+    for(int t=0;t<256;++t;@inner(0)){
+      const dlong et=block*256+t;
+      if(et<Nelements){
+        const dlong e=elementIds[et];
+        mask[e]=(bounds[2*e+1]>low && bounds[2*e]<high);
+      }
+    }
+  }
+}
+
+// Form the prospective LSERK4 candidate locally, or read an assembled SARK4
+// candidate from rhs when p_HCZ_DETECT_STATE is set. Output is an unbuffered
+// binary mask indexed by element, not by position in elementIds. No state,
+// residual, RHS, neighbor data, or unselected mask entry is modified.
+@kernel void bnsHczDetectorQuad2D(const dlong Nelements,
+                                  @restrict const dlong *elementIds,
+                                  @restrict const dlong *neighbors,
+                                  @restrict const dfloat *bounds,
+                                  @restrict const dfloat *cubInterp,
+                                  const dfloat dt,
+                                  const dfloat rkA,
+                                  const dfloat rkB,
+                                  const dfloat rhoL,
+                                  const dfloat rhoH,
+                                  const dfloat phiL,
+                                  const dfloat phiH,
+                                  const dfloat eosB,
+                                  const dfloat phiFloor,
+                                  const dfloat dmpDelta,
+                                  const dfloat dmpEps,
+                                  const dfloat boundTol,
+                                  @restrict const dfloat *q,
+                                  @restrict const dfloat *residual,
+                                  @restrict const dfloat *rhs,
+                                  @restrict int *mask){
+  for(dlong et=0;et<Nelements;++et;@outer(0)){
+    @shared dfloat s_phi[p_Nq][p_Nq];
+    @shared dfloat s_I[p_cubNq][p_Nq];
+    @shared dfloat s_limits[2];
+    @shared int s_bad[p_cubNq][p_cubNq];
+
+    for(int j=0;j<p_cubNq;++j;@inner(1)){
+      for(int i=0;i<p_cubNq;++i;@inner(0)){
+        const dlong e = elementIds[et];
+        if(i<p_Nq)s_I[j][i] = cubInterp[j+i*p_cubNq];
+        if(i==0 && j==0){
+          // The neighborhood always includes this owned element.
+          dfloat lo = bounds[2*e], hi = bounds[2*e+1];
+          for(int k=0;k<9;++k){
+            const dlong nb = neighbors[9*e+k];
+            if(nb>=0){
+              if(bounds[2*nb]<lo)lo = bounds[2*nb];
+              if(bounds[2*nb+1]>hi)hi = bounds[2*nb+1];
+            }
+          }
+          const dfloat absolute = dmpDelta*(phiH-phiL);
+          const dfloat relative = dmpEps*(hi-lo);
+          const dfloat delta = absolute<relative ? relative : absolute;
+          s_limits[0] = lo-delta;
+          s_limits[1] = hi+delta;
+        }
+        int bad = 0;
+        if(i<p_Nq && j<p_Nq){
+          const dlong base = e*12*p_Np+j*p_Nq+i;
+          for(int k=0;k<12;++k){
+#if p_HCZ_DETECT_STATE
+            // SARK4 already formed its candidate from the complete tableau.
+            const dfloat value = rhs[base+k*p_Np];
+#else
+            dfloat increment = dt*rhs[base+k*p_Np];
+            // First-stage residual storage need not be initialized.
+            if(rkA!=0.0)increment += rkA*residual[base+k*p_Np];
+            const dfloat value = q[base+k*p_Np]+rkB*increment;
+#endif
+            if(k==0)s_phi[j][i] = value;
+            if(!isfinite(value))bad = 1;
+          }
+        }
+        s_bad[j][i] = bad;
+      }
+    }
+
+    for(int j=0;j<p_cubNq;++j;@inner(1)){
+      for(int i=0;i<p_cubNq;++i;@inner(0)){
+        int bad = s_bad[j][i];
+        if(i<p_Nq && j<p_Nq){
+          const dfloat phi = s_phi[j][i];
+          const dfloat rho = rhoL+(phi-phiL)*(rhoH-rhoL)/(phiH-phiL);
+          if(!(phi>phiFloor) || !(rho>0.0) || !(eosB*phi<3.999)
+             || phi<s_limits[0] || phi>s_limits[1]
+             || phi<phiL-boundTol*(phiH-phiL)
+             || phi>phiH+boundTol*(phiH-phiL))bad = 1;
+        }
+        dfloat phi = 0.0;
+        for(int a=0;a<p_Nq;++a)for(int b=0;b<p_Nq;++b)
+          phi += s_I[j][a]*s_I[i][b]*s_phi[a][b];
+        const dfloat rho = rhoL+(phi-phiL)*(rhoH-rhoL)/(phiH-phiL);
+        // Deliberately match detect(), not admissible(): the detector checks
+        // only finite, positive mapped density at cubature, with no EOS bound.
+        if(!isfinite(rho) || rho<=0.0)bad = 1;
+        s_bad[j][i] = bad;
+      }
+    }
+
+    for(int j=0;j<p_cubNq;++j;@inner(1)){
+      for(int i=0;i<p_cubNq;++i;@inner(0)){
+        if(i==0 && j==0){
+          int bad = 0;
+          for(int a=0;a<p_cubNq;++a)for(int b=0;b<p_cubNq;++b)
+            bad |= s_bad[a][b];
+          mask[elementIds[et]] = bad;
+        }
+      }
+    }
+  }
+}

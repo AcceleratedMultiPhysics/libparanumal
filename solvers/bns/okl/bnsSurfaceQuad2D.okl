@@ -24,8 +24,22 @@ SOFTWARE.
 
 */
 
+#ifndef p_HCZ
+#define p_HCZ 0
+#endif
+
+#if p_HCZ && p_Nfields != 12
+#error HCZ Quad2D surface transport requires twelve fields
+#endif
+
+#if p_HCZ
+// Avoid float-rounded coefficients in the double-precision HCZ operator.
+#define p_isq12 (1.0/sqrt(12.0))
+#define p_isq6 (1.0/sqrt(6.0))
+#else
 #define p_isq12 (1.f/sqrt(12.f))
 #define p_isq6 (1.f/sqrt(6.f))
+#endif
 
 void upwind(const dfloat nx, const dfloat ny, const dfloat c,
             const dfloat q1M, const dfloat q2M, const dfloat q3M,
@@ -83,6 +97,45 @@ void surfaceTerms(const int e,
   const dlong qidM = eM*p_Np*p_Nfields + vidM;
   const dlong qidP = eP*p_Np*p_Nfields + vidP;
 
+#if p_HCZ
+  // Input contract: bc <= 0 is an interior/periodic trace; bc == 1 is a
+  // stationary kinetic wall. HCZ setup must reject other boundary tags.
+  const int bc = EToB[face+p_Nfaces*e];
+  const dfloat sc = invWJ*sJ;
+
+  // Both HCZ distributions have the same linear H2 transport operator.
+  // Keep the existing element/field/node storage and six-moment flux.
+  #pragma unroll 2
+  for(int distribution=0;distribution<2;++distribution){
+    const int offset = 6*distribution;
+    dfloat qM[6], qP[6], qflux[6];
+
+    #pragma unroll 6
+    for(int fld=0;fld<6;++fld){
+      qM[fld] = q[qidM + (offset+fld)*p_Np];
+      qP[fld] = q[qidP + (offset+fld)*p_Np];
+    }
+
+    if(bc==1){
+      // Python HCZ wall ghost: reverse both first-order moments, retain
+      // the index/pressure and second-order moments. No primitive conversion.
+      #pragma unroll 6
+      for(int fld=0;fld<6;++fld)
+        qP[fld] = qM[fld];
+      qP[1] = -qM[1];
+      qP[2] = -qM[2];
+    }
+
+    upwind(nx, ny, c,
+           qM[0], qM[1], qM[2], qM[3], qM[4], qM[5],
+           qP[0], qP[1], qP[2], qP[3], qP[4], qP[5],
+           qflux);
+
+    #pragma unroll 6
+    for(int fld=0;fld<6;++fld)
+      s_fluxq[es][offset+fld][j][i] += sc*(-qflux[fld]);
+  }
+#else
   const dfloat q1M = q[qidM + 0*p_Np];
   const dfloat q2M = q[qidM + 1*p_Np];
   const dfloat q3M = q[qidM + 2*p_Np];
@@ -134,8 +187,11 @@ void surfaceTerms(const int e,
   s_fluxq[es][3][j][i] += sc*(-qflux[3]);
   s_fluxq[es][4][j][i] += sc*(-qflux[4]);
   s_fluxq[es][5][j][i] += sc*(-qflux[5]);
+#endif
 }
 
+#if !p_HCZ
+// Split/PML and multirate helpers remain exclusive to the legacy BNS model.
 void upwind_split(const dfloat nx, const dfloat ny, const dfloat c,
             const dfloat q1M, const dfloat q2M, const dfloat q3M,
             const dfloat q4M, const dfloat q5M, const dfloat q6M,
@@ -441,6 +497,8 @@ void surfaceMRTerms_split(const int e,
 
 
 
+#endif // !p_HCZ: legacy split/PML and multirate helpers
+
 // This @kernel uses Upwind flux
 @kernel void bnsSurfaceQuad2D(const dlong Nelements,
                              @restrict const  dlong  *  elementIds,
@@ -533,6 +591,7 @@ void surfaceMRTerms_split(const int e,
 
 
 
+#if !p_HCZ
 // This @kernel uses upwind flux
 @kernel void bnsPmlSurfaceQuad2D(const dlong pmlNelements,
                                 @restrict const  dlong  *  pmlElementIds,
@@ -835,3 +894,4 @@ void surfaceMRTerms_split(const int e,
     }
   }
 }
+#endif // !p_HCZ: legacy PML and multirate kernels

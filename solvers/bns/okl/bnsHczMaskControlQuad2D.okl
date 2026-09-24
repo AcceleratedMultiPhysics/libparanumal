@@ -1,0 +1,55 @@
+// Binary mask operations for HCZ LSERK4 retries and SARK4 replays. Owned entries only;
+// current and next are distinct buffers, and halos are managed by the caller.
+@kernel void bnsHczMaskClearQuad2D(const dlong Nelements,
+                                  @restrict int *mask){
+  for(dlong block=0;block<(Nelements+255)/256;++block;@outer(0)){
+    for(int t=0;t<256;++t;@inner(0)){
+      const dlong e=block*256+t;
+      if(e<Nelements)mask[e]=0;
+    }
+  }
+}
+
+@kernel void bnsHczMaskDifferenceQuad2D(const dlong Nelements,
+                                       @restrict const int *current,
+                                       @restrict int *next){
+  for(dlong block=0;block<(Nelements+255)/256;++block;@outer(0)){
+    for(int t=0;t<256;++t;@inner(0)){
+      const dlong e=block*256+t;
+      if(e<Nelements)next[e]=(next[e]!=0 && current[e]==0);
+    }
+  }
+}
+
+@kernel void bnsHczMaskUnionQuad2D(const dlong Nelements,
+                                  @restrict const int *next,
+                                  @restrict int *current){
+  for(dlong block=0;block<(Nelements+255)/256;++block;@outer(0)){
+    for(int t=0;t<256;++t;@inner(0)){
+      const dlong e=block*256+t;
+      if(e<Nelements)current[e]=(current[e]!=0 || next[e]!=0);
+    }
+  }
+}
+
+// One scalar local count, including for empty ranks. Do not read mask halos.
+@kernel void bnsHczMaskCountQuad2D(const dlong Nelements,
+                                  @restrict const int *mask,
+                                  @restrict int *result){
+  for(int block=0;block<1;++block;@outer(0)){
+    @shared int s_count[256];
+    for(int t=0;t<256;++t;@inner(0)){
+      int count=0;
+      for(dlong e=t;e<Nelements;e+=256)count += (mask[e]!=0);
+      s_count[t]=count;
+    }
+    for(int offset=128;offset>0;offset/=2){
+      for(int t=0;t<256;++t;@inner(0)){
+        if(t<offset)s_count[t] += s_count[t+offset];
+      }
+    }
+    for(int t=0;t<256;++t;@inner(0)){
+      if(t==0)result[0]=s_count[0];
+    }
+  }
+}

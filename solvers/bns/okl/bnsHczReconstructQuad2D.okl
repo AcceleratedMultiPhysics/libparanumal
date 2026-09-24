@@ -1,0 +1,103 @@
+/*
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2022 Tim Warburton, Noel Chalmers, Jesse Chan, Ali Karakus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+// Subcell residual -> DG residual, matching project(fv,ns,n,R,true).
+// subRhs: [element][12 moments][subcell]. dgRhs: [element][12 moments][DG node].
+// R: [subcell coordinate][DG coordinate], i.e. R[i+a*p_Nq].
+// weights: one-dimensional DG GLL quadrature weights.
+// Residuals may have either sign. No positivity scaling or clipping belongs here.
+#if p_Nfields != 12
+#error HCZ reconstruction requires twelve fields
+#endif
+#if p_Nq < 2
+#error HCZ reconstruction requires polynomial degree at least one
+#endif
+#define p_Nsubq (2*p_Nq-1)
+#define p_Nsubp (p_Nsubq*p_Nsubq)
+
+@kernel void bnsHczReconstructQuad2D(const dlong Nelements,
+                                    @restrict const dlong *elementIds,
+                                    @restrict const dfloat *R,
+                                    @restrict const dfloat *weights,
+                                    @restrict const dfloat *subRhs,
+                                    @restrict dfloat *dgRhs
+#if p_HCZ_MASKED_RECONSTRUCT
+                                    , @restrict const int *mask
+#endif
+                                    ){
+  for(dlong et=0;et<Nelements;++et;@outer(0)){
+    @shared dfloat s_sub[12][p_Nsubq][p_Nsubq];
+    @shared dfloat s_dg[12][p_Nq][p_Nq];
+    @shared dfloat s_R[p_Nq][p_Nsubq];
+    @shared dfloat s_w[p_Nq];
+    @shared dfloat s_shift[12];
+    for(int j=0;j<p_Nsubq;++j;@inner(1)){
+      for(int i=0;i<p_Nsubq;++i;@inner(0)){
+        for(int k=0;k<12;++k)
+          s_sub[k][j][i]=subRhs[(elementIds[et]*12+k)*p_Nsubp+j*p_Nsubq+i];
+        if(j<p_Nq)s_R[j][i]=R[j+i*p_Nq];
+        if(j==0 && i<p_Nq)s_w[i]=weights[i];
+      }
+    }
+    for(int j=0;j<p_Nsubq;++j;@inner(1)){
+      for(int i=0;i<p_Nsubq;++i;@inner(0)){
+        if(j<p_Nq && i<p_Nq){
+          for(int k=0;k<12;++k){
+            dfloat value=0.0;
+            for(int a=0;a<p_Nsubq;++a)for(int b=0;b<p_Nsubq;++b)
+              value += s_R[j][a]*s_R[i][b]*s_sub[k][a][b];
+            s_dg[k][j][i]=value;
+          }
+        }
+      }
+    }
+    for(int j=0;j<p_Nsubq;++j;@inner(1)){
+      for(int i=0;i<p_Nsubq;++i;@inner(0)){
+        // Use the host's sequential sum order for each moment. The stride
+        // also covers twelve fields when degree one has only nine threads.
+        for(int k=j*p_Nsubq+i;k<12;k+=p_Nsubp){
+          dfloat avg=0.0,dg=0.0;
+          for(int a=0;a<p_Nsubq;++a)for(int b=0;b<p_Nsubq;++b)
+            avg += s_sub[k][a][b]/p_Nsubp;
+          for(int a=0;a<p_Nq;++a)for(int b=0;b<p_Nq;++b)
+            dg += .25*s_w[a]*s_w[b]*s_dg[k][a][b];
+          s_shift[k]=avg-dg;
+        }
+      }
+    }
+    for(int j=0;j<p_Nsubq;++j;@inner(1)){
+      for(int i=0;i<p_Nsubq;++i;@inner(0)){
+        if(j<p_Nq && i<p_Nq){
+          for(int k=0;k<12;++k)
+#if p_HCZ_MASKED_RECONSTRUCT
+            if(mask[elementIds[et]])
+#endif
+              dgRhs[(elementIds[et]*12+k)*p_Np+j*p_Nq+i]=s_dg[k][j][i]+s_shift[k];
+        }
+      }
+    }
+  }
+}

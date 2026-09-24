@@ -310,7 +310,7 @@ protected:
   dfloat sqrtinvNtotal;
 
 
-  void Step(solver_t& solver,
+  bool Step(solver_t& solver,
             deviceMemory<dfloat> o_q,
             std::optional<deviceMemory<dfloat>> o_pmlq,
             deviceMemory<dfloat> o_rkq,

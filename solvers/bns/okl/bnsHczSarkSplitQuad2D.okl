@@ -1,0 +1,20 @@
+// dq/dt = Lambda*q + F(q). The incoming RHS contains the ORIGINAL complete
+// cubature-projected DG collision operator. Subtract nodal Lambda*q here;
+// do not drop the cubature damping, since projection*interpolation is not
+// the identity for the highest GLL polynomial modes.
+@kernel void bnsHczSarkSplitQuad2D(const dlong Nelements,
+                                 const dfloat tauPhiInv,
+                                 const dfloat tauGInv,
+                                 @restrict const dfloat *q,
+                                 @restrict dfloat *rhs){
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+    for(int n=0;n<p_Np;++n;@inner(0)){
+      for(int k=1;k<12;++k){
+        if(k<=5 || k>=9){
+          const dlong id=(e*12+k)*p_Np+n;
+          rhs[id] += (k<=5?tauPhiInv:tauGInv)*q[id];
+        }
+      }
+    }
+  }
+}

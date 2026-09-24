@@ -24,6 +24,14 @@ SOFTWARE.
 
 */
 
+#ifndef p_HCZ
+#define p_HCZ 0
+#endif
+
+#if p_HCZ && p_Nfields != 12
+#error HCZ Quad2D volume transport requires twelve fields
+#endif
+
 @kernel void bnsVolumeQuad2D(const dlong Nelements,
                              @restrict const  dlong  *  elementIds,
                              @restrict const  dfloat *  vgeo,
@@ -44,7 +52,9 @@ SOFTWARE.
 
     @exclusive dlong e;
 
+    #if !p_HCZ
     @exclusive dfloat fx[p_NblockV], fy[p_NblockV];
+    #endif
 
     for(int es=0;es<p_NblockV;++es;@inner(2)){
       for(int j=0;j<p_Nq;++j;@inner(1)){
@@ -62,6 +72,7 @@ SOFTWARE.
           if(es==0)
             s_DT[j][i] = DT[j*p_Nq+i];
 
+          #if !p_HCZ
           const dfloat r =   s_q[es][0][j][i];
           const dfloat u = c*s_q[es][1][j][i]/r;
           const dfloat v = c*s_q[es][2][j][i]/r;
@@ -70,6 +81,7 @@ SOFTWARE.
           fx[es] = 0.0; fy[es] = 0.0;
           bnsBodyForce2D(c, nu, t, x[e*p_Np+j*p_Nq+i], y[e*p_Np+j*p_Nq+i], r, u, v,
                          &(fx[es]), &(fy[es]));
+          #endif
         }
       }
     }
@@ -124,6 +136,19 @@ SOFTWARE.
               r_dqdy[fld] = drdy*r_dqdr[fld] + dsdy*r_dqds[fld];
             }
 
+            #if p_HCZ
+            // Independent H2 transport for the index and hydrodynamic moments.
+            // HCZ gradient-dependent sources and BGK are assembled separately.
+            for(int distribution=0;distribution<2;++distribution){
+              const int offset = 6*distribution;
+              r_rhsq[offset+0] = -c*(r_dqdx[offset+1] + r_dqdy[offset+2]);
+              r_rhsq[offset+1] = -c*(r_dqdx[offset+0] + sqrt(2.0)*r_dqdx[offset+4] + r_dqdy[offset+3]);
+              r_rhsq[offset+2] = -c*(r_dqdx[offset+3] + r_dqdy[offset+0] + sqrt(2.0)*r_dqdy[offset+5]);
+              r_rhsq[offset+3] = -c*(r_dqdx[offset+2] + r_dqdy[offset+1]);
+              r_rhsq[offset+4] = -c*sqrt(2.0)*r_dqdx[offset+1];
+              r_rhsq[offset+5] = -c*sqrt(2.0)*r_dqdy[offset+2];
+            }
+            #else
             // transport operator
             r_rhsq[0] = -c*(r_dqdx[1] + r_dqdy[2]);
             r_rhsq[1] = -c*(r_dqdx[0] + sqrt(2.0)*r_dqdx[4] + r_dqdy[3]);
@@ -138,6 +163,7 @@ SOFTWARE.
             r_rhsq[3] += fx[es]*s_q[es][2][j][i]/c + fy[es]*s_q[es][1][j][i]/c;
             r_rhsq[4] += fx[es]*sqrt(2.0)*s_q[es][1][j][i]/c;
             r_rhsq[5] += fy[es]*sqrt(2.0)*s_q[es][2][j][i]/c;
+            #endif
 
             // Update
             const dlong id = e*p_Nfields*p_Np + j*p_Nq + i;
@@ -153,6 +179,7 @@ SOFTWARE.
 }
 
 
+#if !p_HCZ
 @kernel void bnsPmlVolumeCubQuad2D(const dlong pmlNelements,
                                    @restrict const  dlong  *  pmlElementIds,
                                    @restrict const  dlong  *  pmlIds,
@@ -451,5 +478,4 @@ SOFTWARE.
     }
   }
 }
-
-
+#endif // !p_HCZ

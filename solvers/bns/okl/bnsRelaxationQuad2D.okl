@@ -24,8 +24,20 @@ SOFTWARE.
 
 */
 
+#ifndef p_HCZ
+#define p_HCZ 0
+#endif
+
+#if p_HCZ && p_Nfields != 12
+#error HCZ Quad2D relaxation requires twelve fields
+#endif
+
+#if p_HCZ
+#define p_Nrelax 8
+#else
 #define p_Nvars 3
 #define p_Nrelax 3
+#endif
 
 @kernel void bnsRelaxationQuad2D(const dlong Nelements,
                                @restrict const  dlong *  elementIds,
@@ -35,6 +47,14 @@ SOFTWARE.
                                @restrict const  dfloat *  cubProject,
                                const int semiAnalytic,
                                const dfloat tauInv,
+                               #if p_HCZ
+                               const dfloat c,
+                               const dfloat tauPhiInv,
+                               const dfloat rhoL,
+                               const dfloat rhoH,
+                               const dfloat phiL,
+                               const dfloat phiH,
+                               #endif
                                @restrict const  dfloat *  q,
                                      @restrict dfloat *  rhsq){
 
@@ -66,6 +86,15 @@ SOFTWARE.
               }
             }
           }
+
+          #if p_HCZ
+          // Keep the tensor interpolation/projection stages defined on
+          // inactive lanes of a partial block. No global state is read.
+          if (et>=Nelements) {
+            for(int fld=0; fld<p_Nfields; ++fld)
+              s_q[es][fld][j][i] = 0.0;
+          }
+          #endif
 
           if ((es==0) && j<p_Nq) {
             s_cubInterp[j][i] = cubInterp[i+j*p_cubNq];
@@ -146,6 +175,27 @@ SOFTWARE.
             const dlong gid = e*p_cubNp*p_Nvgeo+ j*p_cubNq +i;
             const dfloat JW = cubvgeo[gid + p_JWID*p_cubNp];
 
+            #if p_HCZ
+            // Explicit HCZ BGK: the caller must supply semiAnalytic=0,
+            // positive relaxation times/c, and positive cubature density.
+            // tauInv is 1/tauG. Pressure r_q[6] is an independent moment.
+            const dfloat phi = r_q[0];
+            const dfloat rho = rhoL + (phi-phiL)*(rhoH-rhoL)/(phiH-phiL);
+            const dfloat u = r_q[7]/(rho*c);
+            const dfloat v = r_q[8]/(rho*c);
+            const dfloat c2 = c*c;
+
+            s_q[es][1][j][i] = JW*tauPhiInv*(phi*u/c - r_q[1]);
+            s_q[es][2][j][i] = JW*tauPhiInv*(phi*v/c - r_q[2]);
+            s_q[es][3][j][i] = JW*tauPhiInv*(phi*u*v/c2 - r_q[3]);
+            s_q[es][4][j][i] = JW*tauPhiInv*(phi*u*u/(sqrt(2.0)*c2) - r_q[4]);
+            s_q[es][5][j][i] = JW*tauPhiInv*(phi*v*v/(sqrt(2.0)*c2) - r_q[5]);
+            s_q[es][9][j][i] = JW*tauInv*(rho*u*v - r_q[9]);
+            s_q[es][10][j][i] = JW*tauInv*(rho*u*u/sqrt(2.0) - r_q[10]);
+            s_q[es][11][j][i] = JW*tauInv*(rho*v*v/sqrt(2.0) - r_q[11]);
+            // Fields 0, 6, 7 and 8 have exactly zero collision and are
+            // excluded from projection and the additive RHS update.
+            #else
             if(semiAnalytic){
               // BGK relaxation approximation to the Boltzmann collision operator
               s_q[es][3][j][i] =  JW*tauInv*(r_q[1]*r_q[2]/(r_q[0]          ));
@@ -158,6 +208,7 @@ SOFTWARE.
               s_q[es][4][j][i] = -JW*tauInv*(r_q[4] - r_q[1]*r_q[1]/(r_q[0]*sqrt(2.0)));
               s_q[es][5][j][i] = -JW*tauInv*(r_q[5] - r_q[2]*r_q[2]/(r_q[0]*sqrt(2.0)));
             }
+            #endif
           }
         }
       }
@@ -177,7 +228,12 @@ SOFTWARE.
             for (int n=0;n<p_cubNq;n++) {
               const dfloat Pnj = s_cubProject[n][j];
               for(int fld=0; fld<p_Nrelax; fld++){
+                #if p_HCZ
+                const int field = fld<5 ? fld+1 : fld+4;
+                r_q[fld] += Pnj*s_q[es][field][n][i];
+                #else
                 r_q[fld] += Pnj*s_q[es][fld+p_Nvars][n][i];
+                #endif
               }
             }
           }
@@ -224,7 +280,12 @@ SOFTWARE.
             const dlong rhsId = e*p_Np*p_Nfields + j*p_Nq + i;
 
             for(int fld=0; fld<p_Nrelax; fld++){
+              #if p_HCZ
+              const int field = fld<5 ? fld+1 : fld+4;
+              rhsq[rhsId + field*p_Np] += invJW*r_q[fld];
+              #else
               rhsq[rhsId + (fld+p_Nvars)*p_Np]  += invJW*r_q[fld];
+              #endif
             }
           }
         }
@@ -236,6 +297,7 @@ SOFTWARE.
 
 
 
+#if !p_HCZ
 // Fully Explicit Scheme Uses Clasical half Half Splitting
 @kernel void bnsPmlRelaxationCubQuad2D(const dlong pmlNelements,
                                   @restrict const  dlong *  pmlElementIds,
@@ -470,3 +532,4 @@ SOFTWARE.
     }
   }
 }
+#endif // !p_HCZ
