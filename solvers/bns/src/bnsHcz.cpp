@@ -1,14 +1,16 @@
 #include "bns.hpp"
 #include "hczQuad2D.hpp"
 #include "hczDeviceMask.hpp"
+#include "hczBubble.hpp"
 #include <fstream>
 #include <iomanip>
 #include <map>
 #include <set>
 #include <climits>
+#include <sstream>
 
 // Retain the host reference, with an optional OCCA DG/subcell spatial path. Both use
-// the HCZ Cartesian topology, including periodic x and the selected y boundary.
+// the HCZ Cartesian topology and the configured periodic/wall boundaries.
 // OCCA physics uses native field-major storage and libp's OGS element halos.
 class bnsHcz_t {
 public:
@@ -16,7 +18,11 @@ public:
   std::unique_ptr<hcz::QuadOperator> op;
   int nx=0,ny=0,frame=0;
   double width=0,height=0,interfaceWidth=0,amplitude=0,initialMass=0,initialIndex=0;
-  bool periodicY=false;
+  bool periodicY=false,periodicX=true;
+  double bubbleRadius=0,bubbleX=0,bubbleY=0;
+  bool lightBubble=false;
+  bool compactCircle=false,mechanicalBubble=false;
+  hcz::BubblePressure bubblePressure;
   std::string initial;
   std::string dgBackend;
   bool useOcca=false, verifyOcca=false;
@@ -56,6 +62,10 @@ public:
   deviceMemory<dfloat> o_state, o_density, o_potentials, o_gradients;
   kernel_t thermodynamicsKernel, gradVolumeKernel, gradSurfaceKernel, sourceKernel;
   kernel_t admissibilityKernel, admissibilityReduceKernel;
+  deviceMemory<dfloat> o_capillaryScalars, o_capillaryGradients;
+  kernel_t capillaryPrepareKernel, capillarySourceKernel, capillaryDivergenceSurfaceKernel;
+  deviceMemory<dfloat> o_subCapillaryStress, o_subCapillaryRhs;
+  kernel_t subCapillaryStressKernel, subCapillarySourceKernel, subCapillaryAddKernel, capillaryReconstructKernel;
   deviceMemory<dlong> o_neighbors;
   deviceMemory<int> o_mask, o_nextMask, o_maskScratch;
   deviceMemory<dfloat> o_A, o_R, o_weights, o_baseRhs;
@@ -75,9 +85,10 @@ public:
     std::vector<int> o(counts.size(),0); for(size_t i=1;i<counts.size();i++) o[i]=o[i-1]+counts[i-1];return o;
   }
   int neighborId(int gid,int dx,int dy) const {
-    int x=(gid%nx+dx+nx)%nx,y=gid/nx+dy;
+    int x=gid%nx+dx,y=gid/nx+dy;
+    if(periodicX)x=(x+nx)%nx;
     if(periodicY) y=(y+ny)%ny;
-    return y<0 || y>=ny?-1:x+y*nx;
+    return x<0 || x>=nx || y<0 || y>=ny?-1:x+y*nx;
   }
   void setup() {
     auto& m=b.mesh;
@@ -93,6 +104,7 @@ public:
     m.settings.getSetting("BOX DIMX",width); m.settings.getSetting("BOX DIMY",height);
     LIBP_ABORT("Invalid HCZ box dimensions",nx<1 || ny<1 || width<=0 || height<=0);
     periodicY=b.settings.compareSetting("HCZ Y BOUNDARY","PERIODIC");
+    periodicX=b.settings.compareSetting("HCZ X BOUNDARY","PERIODIC");
     b.settings.getSetting("HCZ INITIAL CONDITION",initial);
     LIBP_ABORT("HCZ RT initialization requires y walls",initial=="RT" && periodicY);
     double hx=width/nx,hy=height/ny;
@@ -168,6 +180,31 @@ public:
     LIBP_ABORT("HCZ INTERFACE THRESHOLD must be finite and strictly between 0 and 0.5",
                !std::isfinite(p.interfaceThreshold) || p.interfaceThreshold<=0 || p.interfaceThreshold>=.5);
     interfaceWidth=setting("HCZ INTERFACE WIDTH");amplitude=setting("HCZ PERTURBATION");
+    bubbleRadius=setting("HCZ BUBBLE RADIUS");
+    bubbleX=setting("HCZ BUBBLE CENTER X");bubbleY=setting("HCZ BUBBLE CENTER Y");
+    lightBubble=b.settings.compareSetting("HCZ BUBBLE PHASE","LIGHT");
+    compactCircle=b.settings.compareSetting("HCZ BUBBLE PROFILE","COMPACT");
+    mechanicalBubble=b.settings.compareSetting("HCZ BUBBLE PRESSURE","MECHANICAL");
+    LIBP_ABORT("HCZ mechanical bubble pressure requires BUBBLE and COMPACT profile",
+               mechanicalBubble && (initial!="BUBBLE" || !compactCircle));
+    if(initial=="BUBBLE") {
+      LIBP_ABORT("Invalid HCZ bubble geometry",!std::isfinite(bubbleRadius) || bubbleRadius<0 ||
+        !std::isfinite(bubbleX) || !std::isfinite(bubbleY) ||
+        (bubbleX<0 && bubbleX!=-1) || (bubbleY<0 && bubbleY!=-1));
+      if(bubbleRadius==0)bubbleRadius=.2*std::min(width,height);
+      if(bubbleX==-1)bubbleX=width/2;
+      if(bubbleY==-1)bubbleY=height/2;
+      LIBP_ABORT("HCZ bubble circle must fit strictly inside the box",bubbleX-bubbleRadius<=0 ||
+        bubbleX+bubbleRadius>=width || bubbleY-bubbleRadius<=0 || bubbleY+bubbleRadius>=height);
+      if(compactCircle) {
+        const double half=.5*interfaceWidth/hcz::bubbleTransitionSpan();
+        LIBP_ABORT("HCZ compact bubble transition must fit between the origin and walls",
+          !std::isfinite(half) || half<=0 || half>=bubbleRadius ||
+          bubbleX-bubbleRadius-half<=0 || bubbleX+bubbleRadius+half>=width ||
+          bubbleY-bubbleRadius-half<=0 || bubbleY+bubbleRadius+half>=height);
+      }
+      if(mechanicalBubble)bubblePressure.setup(bubbleRadius,interfaceWidth,p.phiL,p.phiH,lightBubble);
+    }
     bool finite=true;
     for(double v:{p.c,b.nu,p.tauPhi,p.rhoL,p.rhoH,p.phiL,p.phiH,p.eosB,p.eosRatio,p.gravity,p.kappa,
         p.alpha,p.wenoEps,p.dmpDelta,p.dmpEps,p.boundTol,interfaceWidth,amplitude}) finite &= std::isfinite(v);
@@ -178,7 +215,6 @@ public:
     LIBP_ABORT("Periodic HCZ y boundaries require zero gravity",periodicY && p.gravity!=0);
     b.settings.getSetting("HCZ DG BACKEND",dgBackend);
     useOcca=dgBackend!="HOST";verifyOcca=dgBackend=="VERIFY";
-    LIBP_ABORT("HCZ OCCA/VERIFY requires HCZ KAPPA = 0",useOcca && p.kappa!=0);
     LIBP_ABORT("HCZ SARK4 requires HCZ KAPPA = 0",useSark && p.kappa!=0);
     b.tauInv=1/p.tauG;b.Nfields=12;b.Npmlfields=0;b.semiAnalytic=useSark;
     dlong entries=count*m.Np*12;
@@ -220,7 +256,7 @@ public:
         const int axis=(face==1 || face==3)?0:1;
         const int sign=(face==0 || face==3)?-1:1;
         const int nb=op->neighbor[e][4+sign*(axis?3:1)];
-        boundary[e*4+face]=nb<0?1:0;
+        boundary[e*4+face]=nb<0?(axis?1:2):0;
         for(int t=0;t<m.Nfp;t++) {
           const int i=axis?t:(sign<0?0:m.Nq-1);
           const int j=axis?(sign<0?0:m.Nq-1):t;
@@ -267,6 +303,16 @@ public:
     admissibilityKernel=build("bnsHczAdmissibilityQuad2D");
     admissibilityReduceKernel=b.platform.buildKernel(std::string(DBNS)+"okl/bnsHczAdmissibilityQuad2D.okl",
                                                     "bnsHczAdmissibilityReduce",props);
+    if(op->p.kappa>0 && !op->p.subcell) {
+      o_capillaryScalars=b.platform.malloc<dfloat>(static_cast<dlong>(op->total)*m.Np*2);
+      o_capillaryGradients=b.platform.malloc<dfloat>(static_cast<dlong>(op->local)*m.Np*4);
+      const std::string file=std::string(DBNS)+"okl/bnsHczCapillaryQuad2D.okl";
+      capillaryPrepareKernel=b.platform.buildKernel(file,"bnsHczCapillaryPrepareQuad2D",props);
+      capillarySourceKernel=b.platform.buildKernel(file,"bnsHczCapillarySourceQuad2D",props);
+      properties_t divProps=props;divProps["defines/p_HCZ_NEUMANN_FLUX"]=1;
+      capillaryDivergenceSurfaceKernel=b.platform.buildKernel(std::string(DBNS)+"okl/bnsHczGradSurfaceQuad2D.okl",
+                                                            "bnsHczGradSurfaceQuad2D",divProps);
+    }
     if(op->p.subcell) setupOccaSubcell(props);
   }
 
@@ -307,6 +353,17 @@ public:
     reconstructKernel=build("bnsHczReconstructQuad2D","bnsHczReconstructQuad2D");
     props["defines/p_HCZ_MASKED_RECONSTRUCT"]=0;
     mixedSurfaceKernel=build("bnsHczMixedSurfaceQuad2D","bnsHczMixedSurfaceQuad2D");
+    if(op->p.kappa>0) {
+      o_subCapillaryStress=b.platform.malloc<dfloat>(total*np*3);
+      o_subCapillaryRhs=b.platform.malloc<dfloat>(count*np*12);
+      const std::string file="bnsHczCapillarySubcellQuad2D";
+      subCapillaryStressKernel=build(file,"bnsHczCapillaryStressQuad2D");
+      subCapillarySourceKernel=build(file,"bnsHczCapillarySubcellSourceQuad2D");
+      subCapillaryAddKernel=build(file,"bnsHczCapillarySubcellAddQuad2D");
+      props["defines/p_HCZ_ADD_RECONSTRUCT"]=1;
+      capillaryReconstructKernel=build("bnsHczReconstructQuad2D","bnsHczReconstructQuad2D");
+      props["defines/p_HCZ_ADD_RECONSTRUCT"]=0;
+    }
     o_indexBounds=b.platform.malloc<dfloat>(std::max(dlong(1),2*total));
     if(verifyOcca)detectorMask.malloc(count);
     indexBoundsKernel=build("bnsHczDetectorQuad2D","bnsHczIndexBoundsQuad2D");
@@ -362,6 +419,93 @@ public:
     return valid;
   }
 
+  std::string admissibilitySummary(const hcz::Vec& q) const {
+    // Failure-only diagnostics. Keep successful stages entirely on device.
+    const auto& p=op->p;
+    double range[4]={INFINITY,INFINITY,INFINITY,INFINITY},global[4];
+    long long bad[2]={},globalBad[2];
+    const auto cub=op->project(q,op->n,op->nc,op->I);
+    for(int e=0;e<op->local;e++) {
+      for(int j=0;j<op->n;j++)for(int i=0;i<op->n;i++) {
+        const auto s=op->get(q,e,j,i,op->n);
+        bool invalid=!p.physical(s[0]);
+        for(double v:s)invalid|=!std::isfinite(v);
+        bad[0]+=invalid;
+        if(std::isfinite(s[0])) {
+          range[0]=std::min(range[0],s[0]);range[1]=std::min(range[1],-s[0]);
+          range[2]=std::min(range[2],p.rho(s[0]));
+        }
+      }
+      for(int j=0;j<op->nc;j++)for(int i=0;i<op->nc;i++) {
+        const auto s=op->get(cub,e,j,i,op->nc);
+        bool invalid=!(p.rho(s[0])>0);
+        for(double v:s)invalid|=!std::isfinite(v);
+        bad[1]+=invalid;
+        if(std::isfinite(s[0]))range[3]=std::min(range[3],p.rho(s[0]));
+      }
+    }
+    MPI_Allreduce(range,global,4,MPI_DOUBLE,MPI_MIN,b.comm.comm());
+    MPI_Allreduce(bad,globalBad,2,MPI_LONG_LONG_INT,MPI_SUM,b.comm.comm());
+    std::ostringstream out;
+    out<<std::setprecision(12)<<"nodal phi=["<<global[0]<<","<<-global[1]
+       <<"], min nodal rho="<<global[2]<<", min cubature rho="<<global[3]
+       <<", invalid nodes="<<globalBad[0]<<", invalid cubature points="<<globalBad[1];
+    return out.str();
+  }
+
+  std::string lserkCandidateFailure(deviceMemory<dfloat>& input,deviceMemory<dfloat>& residual,
+                                   deviceMemory<dfloat>& rhs,dfloat dt,dfloat a,dfloat rkB) {
+    auto state=unpack(input),candidate=state;
+    const auto force=unpack(rhs);
+    hcz::Vec res;if(a!=0)res=unpack(residual);
+    for(size_t i=0;i<size_t(op->local)*b.mesh.Np*12;i++)
+      candidate[i]+=rkB*(dt*force[i]+(a==0?0:a*res[i]));
+    std::ostringstream out;
+    out<<std::setprecision(12)<<"HCZ LSERK4 candidate remains nonphysical; dt="<<dt
+       <<", index floor="<<op->p.floor()<<"\n"
+       <<"    Input: "<<admissibilitySummary(state)<<"\n"
+       <<"    Candidate: "<<admissibilitySummary(candidate)<<"\n"
+       <<"    Compare smaller CFL and spatial/interface resolution; reducing CFL alone may not resolve this failure.";
+    return out.str();
+  }
+
+  void occaCapillarySource(deviceMemory<dfloat>& output) {
+    auto& m=b.mesh;const auto& p=op->p;const dlong count=op->local;
+    for(int pass=0;pass<3;pass++) {
+      if(count)capillaryPrepareKernel(count,o_elementIds,pass,
+                                     pass==0?o_state:o_capillaryGradients,o_capillaryScalars);
+      elementHalo.ExchangeStart(o_capillaryScalars,2*m.Np);
+      if(count)gradVolumeKernel(count,o_elementIds,m.o_vgeo,m.o_D,o_capillaryScalars,o_capillaryGradients);
+      elementHalo.ExchangeFinish(o_capillaryScalars,2*m.Np);
+      if(count) {
+        auto& surface=pass==1?capillaryDivergenceSurfaceKernel:gradSurfaceKernel;
+        surface(count,o_elementIds,m.o_sgeo,o_vmapM,o_vmapP,o_boundary,o_capillaryScalars,o_capillaryGradients);
+      }
+    }
+    if(count)capillarySourceKernel(count,o_elementIds,p.c,p.kappa,p.rhoL,p.rhoH,p.phiL,p.phiH,
+                                  o_state,o_capillaryGradients,output);
+  }
+
+  void occaHybridCapillarySource(deviceMemory<dfloat>& output) {
+    const auto& p=op->p;const dlong count=op->local;const int np=op->ns*op->ns;
+    if(count) {
+      projectSubcellKernel(count,o_elementIds,o_A,o_state,o_sub);
+      scaleSubcellKernel(count,o_elementIds,p.floor(),o_sub,o_checkFlags);
+    }
+    admissibilityReduceKernel(count,o_checkFlags,o_checkResult);
+    o_checkResult.copyTo(checkResult);
+    int invalid=0;MPI_Allreduce(checkResult.ptr(),&invalid,1,MPI_INT,MPI_BOR,b.comm.comm());
+    if(invalid)throw hcz::SubcellMeanError();
+    elementHalo.ExchangeStart(o_sub,12*np);elementHalo.ExchangeFinish(o_sub,12*np);
+    if(count)subCapillaryStressKernel(count,o_elementIds,o_neighbors,op->hx,op->hy,p.kappa,o_sub,o_subCapillaryStress);
+    elementHalo.ExchangeStart(o_subCapillaryStress,3*np);elementHalo.ExchangeFinish(o_subCapillaryStress,3*np);
+    if(count) {
+      subCapillarySourceKernel(count,o_elementIds,o_neighbors,op->hx,op->hy,p.c,p.rhoL,p.rhoH,p.phiL,p.phiH,
+                               o_sub,o_subCapillaryStress,o_subCapillaryRhs);
+      capillaryReconstructKernel(count,o_elementIds,o_R,o_weights,o_subCapillaryRhs,output);
+    }
+  }
+
   void occaRhs(deviceMemory<dfloat>& input,deviceMemory<dfloat>& output,
                dfloat time) {
     // In input mode neither residual nor RHS is read; valid dummy buffers
@@ -392,6 +536,9 @@ public:
     if(count) {
       gradSurfaceKernel(count,o_elementIds,m.o_sgeo,o_vmapM,o_vmapP,o_boundary,o_potentials,o_gradients);
       sourceKernel(count,o_elementIds,p.c,p.gravity,p.rhoL,p.rhoH,p.phiL,p.phiH,o_state,o_gradients,output);
+    }
+    if(p.kappa>0) {
+      if(p.subcell)occaHybridCapillarySource(output);else occaCapillarySource(output);
     }
     if(verifyOcca) {
       const auto reference=op->dg(unpack(input)),actual=unpack(output);
@@ -456,6 +603,7 @@ public:
       subcellGradientKernel(count,o_elementIds,o_neighbors,op->hx,op->hy,o_subPotentials,o_subGradients);
       subcellSourceKernel(count,o_elementIds,p.c,p.gravity,p.rhoL,p.rhoH,p.phiL,p.phiH,
                           o_sub,o_subGradients,o_subRhs);
+      if(p.kappa>0)subCapillaryAddKernel(count,o_elementIds,o_subCapillaryRhs,o_subRhs);
       reconstructKernel(count,o_elementIds,o_R,o_weights,o_subRhs,output,o_mask);
       mixedSurfaceKernel(count,o_elementIds,o_neighbors,o_mask,o_R,o_weights,p.c,op->hx,op->hy,
                          o_state,o_faces,output);
@@ -704,7 +852,12 @@ public:
       double wave=2*M_PI/width, slope=-amplitude*width*wave*std::sin(wave*x);
       d=(y-height/2-amplitude*width*std::cos(wave*x))/std::sqrt(1+slope*slope);
     } else if(initial=="SLAB") d=.2*width-std::abs(x-width/2);
-    else d=.2*std::min(width,height)-std::hypot(x-width/2,y-height/2);
+    else {
+      const double radius=std::hypot(x-bubbleX,y-bubbleY);
+      if(compactCircle)return hcz::compactBubble(radius,bubbleRadius,interfaceWidth,p.phiL,p.phiH,lightBubble)[0];
+      d=bubbleRadius-radius;
+      if(lightBubble)d=-d;
+    }
     return p.phiL+.5*(1+std::tanh(d*2*std::atanh(.8)/interfaceWidth))*(p.phiH-p.phiL);
   }
   void initialize() {
@@ -726,6 +879,7 @@ public:
       for(int j=0;j<op->n;j++) {
         int yid=ey*(op->n-1)+j;
         q[op->id(e,j,i,0,op->n)]=phi(x,ys[yid]);q[op->id(e,j,i,6,op->n)]=pressure[yid];
+        if(mechanicalBubble)q[op->id(e,j,i,6,op->n)]+=op->p.kappa*bubblePressure.value(std::hypot(x-bubbleX,ys[yid]-bubbleY));
       }
     }
     LIBP_ABORT("HCZ initial profile has nonphysical nodal/cubature values; resolve or widen the interface",!op->admissible(q));
@@ -756,6 +910,31 @@ public:
     MPI_Allreduce(&speed,&globalSpeed,1,MPI_DOUBLE,MPI_MAX,b.comm.comm());
     int troubled;MPI_Allreduce(&op->lastTroubled,&troubled,1,MPI_INT,MPI_SUM,b.comm.comm());
     std::string prefix;b.settings.getSetting("OUTPUT FILE NAME",prefix);
+    if(initial=="BUBBLE" && b.settings.compareSetting("OUTPUT TO FILE","TRUE")) {
+      // Unclipped diffuse phase fraction: its integral follows conserved phi.
+      // Reporting uses the same GLL quadrature as the conservation diagnostic.
+      double local[5]={},global[5]={};
+      for(int e=0;e<op->local;e++)for(int j=0;j<op->n;j++)for(int i=0;i<op->n;i++) {
+        const auto s=op->get(q,e,j,i,op->n);
+        double a=(s[0]-op->p.phiL)/(op->p.phiH-op->p.phiL);
+        if(lightBubble)a=1-a;
+        const double w=.25*op->hx*op->hy*op->weights[i]*op->weights[j]*a;
+        const double x=(gids[e]%nx+.5+.5*op->nodes[i])*op->hx;
+        const double y=(gids[e]/nx+.5+.5*op->nodes[j])*op->hy;
+        local[0]+=w;local[1]+=w*x;local[2]+=w*y;
+        local[3]+=w*s[7]/(op->p.rho(s[0])*op->p.c);
+        local[4]+=w*s[8]/(op->p.rho(s[0])*op->p.c);
+      }
+      MPI_Allreduce(local,global,5,MPI_DOUBLE,MPI_SUM,b.comm.comm());
+      if(b.comm.rank()==0) {
+        std::ofstream csv(prefix+"_bubble.csv",frame==0?std::ios::out:std::ios::app);
+        LIBP_ABORT("Cannot open HCZ bubble diagnostics",!csv);
+        if(frame==0)csv<<"time,area,centroid_x,centroid_y,mean_u,rise_velocity\n";
+        csv<<std::setprecision(17)<<time<<","<<global[0];
+        for(int k=1;k<5;k++)csv<<","<<(global[0]>0?global[k]/global[0]:std::numeric_limits<double>::quiet_NaN());
+        csv<<"\n";
+      }
+    }
     if(b.comm.rank()==0) {
       std::cout << std::setprecision(12) << "HCZ t="<<time<<" step="<<step<<" mass="<<totals[1]<<" mass error="<<totals[1]-initialMass
         <<" phi=["<<globalLo<<","<<globalHi<<"] max speed="<<globalSpeed<<" troubled="<<troubled<<"\n";
@@ -905,7 +1084,7 @@ void bns_t::rhsf_lserk4(deviceMemory<dfloat>& input,deviceMemory<dfloat>& residu
       if(hcz->op->p.subcell)hcz->occaSubcellStage(input,residual,output,dt,a,b);
       else hcz->op->lastTroubled=0;
       if(!hcz->deviceAdmissible(input,residual,output,true,dt,a,b))
-        throw std::runtime_error("HCZ LSERK4 candidate remains nonphysical; reduce CFL");
+        throw std::runtime_error(hcz->lserkCandidateFailure(input,residual,output,dt,a,b));
       hcz->deviceStageActive=false;
     } else {
       auto state=hcz->unpack(input);hcz::Vec res;

@@ -99,7 +99,7 @@ void surfaceTerms(const int e,
 
 #if p_HCZ
   // Input contract: bc <= 0 is an interior/periodic trace; bc == 1 is a
-  // stationary kinetic wall. HCZ setup must reject other boundary tags.
+  // stationary kinetic wall; bc == 2 is an x-normal specular slip wall.
   const int bc = EToB[face+p_Nfaces*e];
   const dfloat sc = invWJ*sJ;
 
@@ -124,6 +124,12 @@ void surfaceTerms(const int e,
         qP[fld] = qM[fld];
       qP[1] = -qM[1];
       qP[2] = -qM[2];
+    }
+    if(bc==2){
+      #pragma unroll 6
+      for(int fld=0;fld<6;++fld)qP[fld]=qM[fld];
+      qP[1]=-qM[1];
+      qP[3]=-qM[3];
     }
 
     upwind(nx, ny, c,

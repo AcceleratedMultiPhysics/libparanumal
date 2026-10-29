@@ -25,7 +25,8 @@ SOFTWARE.
 */
 
 // Central scalar traces, following the libp Quad2D gradient surface assembly.
-// EToB <= 0: interior/periodic; EToB == 1: stationary wall, scalarP=scalarM.
+// EToB <= 0: interior/periodic; EToB > 0: wall, scalarP=scalarM.
+// p_HCZ_NEUMANN_FLUX selects zero normal grad(phi) flux for capillary divergence.
 // Caller validates boundary tags and supplies potential halos before launch.
 void hczGradientSurfaceTerms(const dlong e,
                               const int es,
@@ -41,7 +42,7 @@ void hczGradientSurfaceTerms(const dlong e,
                               dfloat s_flux[p_NblockS][4][p_Nq][p_Nq]){
   // A copied scalar wall trace has exactly zero jump. Do not read its
   // exterior map: no exterior potential value is required at a wall.
-  if(EToB[e*p_Nfaces+face]!=1){
+  if(EToB[e*p_Nfaces+face]<=0){
     const dlong idM = vmapM[sk];
     const dlong idP = vmapP[sk];
     const dlong baseM = e*2*p_Np+idM%p_Np;
@@ -55,6 +56,18 @@ void hczGradientSurfaceTerms(const dlong e,
       s_flux[es][2*fld+1][j][i] += sc*ny*jump;
     }
   }
+#if p_HCZ_NEUMANN_FLUX
+  else {
+    // Only the divergence pass of capillarity uses this variant. Inputs
+    // are (phi_x,phi_y); set their numerical normal flux to zero.
+    const dlong node=vmapM[sk]%p_Np;
+    const dfloat nx=sgeo[sk*p_Nsgeo+p_NXID];
+    const dfloat ny=sgeo[sk*p_Nsgeo+p_NYID];
+    const dfloat sc=sgeo[sk*p_Nsgeo+p_WIJID]*sgeo[sk*p_Nsgeo+p_SJID];
+    s_flux[es][0][j][i]-=sc*nx*potentials[e*2*p_Np+node];
+    s_flux[es][3][j][i]-=sc*ny*potentials[(e*2+1)*p_Np+node];
+  }
+#endif
 }
 
 @kernel void bnsHczGradSurfaceQuad2D(const dlong Nelements,

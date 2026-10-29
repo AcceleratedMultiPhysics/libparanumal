@@ -1,0 +1,57 @@
+// Pure-DG HCZ capillarity. Reuse the two-scalar central gradient
+// kernels in three passes: phi -> grad(phi) -> lap(phi) -> grad(lap(phi)).
+// Scalars: [element][2][node]; gradients: [element][4][node].
+// Separate input/output allocations are required. Only selected owned
+// elements are written; the caller exchanges scalars before each gradient.
+@kernel void bnsHczCapillaryPrepareQuad2D(const dlong Nelements,
+                                         @restrict const dlong *elementIds,
+                                         const int pass,
+                                         @restrict const dfloat *input,
+                                         @restrict dfloat *scalars){
+  for(dlong et=0;et<Nelements;++et;@outer(0)){
+    for(int node=0;node<p_Np;++node;@inner(0)){
+      const dlong e=elementIds[et];
+      const dlong out=e*2*p_Np+node;
+      if(pass==0){
+        scalars[out]=input[e*12*p_Np+node];
+        scalars[out+p_Np]=0.0;
+      }else if(pass==1){
+        scalars[out]=input[e*4*p_Np+node];
+        scalars[out+p_Np]=input[(e*4+1)*p_Np+node];
+      }else{
+        scalars[out]=input[e*4*p_Np+node]+input[(e*4+3)*p_Np+node];
+        scalars[out+p_Np]=0.0;
+      }
+    }
+  }
+}
+
+// Add ONLY the capillary increment to the existing HCZ moment source.
+// Force density F = kappa*phi*grad(lap(phi)); do not divide by rho.
+@kernel void bnsHczCapillarySourceQuad2D(const dlong Nelements,
+                                        @restrict const dlong *elementIds,
+                                        const dfloat c,
+                                        const dfloat kappa,
+                                        const dfloat rhoL,
+                                        const dfloat rhoH,
+                                        const dfloat phiL,
+                                        const dfloat phiH,
+                                        @restrict const dfloat *q,
+                                        @restrict const dfloat *gradients,
+                                        @restrict dfloat *rhs){
+  for(dlong et=0;et<Nelements;++et;@outer(0)){
+    for(int node=0;node<p_Np;++node;@inner(0)){
+      const dlong e=elementIds[et],base=e*12*p_Np+node;
+      const dfloat phi=q[base];
+      const dfloat rho=rhoL+(phi-phiL)*(rhoH-rhoL)/(phiH-phiL);
+      const dfloat u=q[base+7*p_Np]/(rho*c),v=q[base+8*p_Np]/(rho*c);
+      const dfloat fx=kappa*phi*gradients[e*4*p_Np+node];
+      const dfloat fy=kappa*phi*gradients[(e*4+1)*p_Np+node];
+      rhs[base+7*p_Np]+=c*fx;
+      rhs[base+8*p_Np]+=c*fy;
+      rhs[base+9*p_Np]+=u*fy+v*fx;
+      rhs[base+10*p_Np]+=sqrt(2.0)*u*fx;
+      rhs[base+11*p_Np]+=sqrt(2.0)*v*fy;
+    }
+  }
+}

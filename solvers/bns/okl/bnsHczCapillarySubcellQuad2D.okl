@@ -1,0 +1,94 @@
+// Hybrid capillarity on a common auxiliary subcell grid, independent of mask.
+// sub/source: [element][12][node]; stress: [element][xx,xy,yy][node].
+// Caller supplies scaled subcell halos, then exchanges all three stresses.
+// The divergence uses one shared central traction on every interior face.
+#define p_Nsubq (2*p_Nq-1)
+#define p_Nsubp (p_Nsubq*p_Nsubq)
+
+dfloat hczCapillaryPhi(const dlong e,const int j,const int i,
+                      const dlong *neighbors,const dfloat *sub){
+  const int dx=i<0?-1:(i>=p_Nsubq?1:0),dy=j<0?-1:(j>=p_Nsubq?1:0);
+  const int wallX=dx && neighbors[9*e+4+dx]<0;
+  const int wallY=dy && neighbors[9*e+4+3*dy]<0;
+  const dlong other=neighbors[9*e+4+(wallX?0:dx)+(wallY?0:3*dy)];
+  const int ii=wallX?(i<0?0:p_Nsubq-1):i-dx*p_Nsubq;
+  const int jj=wallY?(j<0?0:p_Nsubq-1):j-dy*p_Nsubq;
+  return sub[other*12*p_Nsubp+jj*p_Nsubq+ii];
+}
+
+@kernel void bnsHczCapillaryStressQuad2D(const dlong Nelements,
+                                        @restrict const dlong *elementIds,
+                                        @restrict const dlong *neighbors,
+                                        const dfloat hx,const dfloat hy,const dfloat kappa,
+                                        @restrict const dfloat *sub,
+                                        @restrict dfloat *stress){
+  for(dlong et=0;et<Nelements;++et;@outer(0)){
+    for(int node=0;node<p_Nsubp;++node;@inner(0)){
+      const dlong e=elementIds[et];const int i=node%p_Nsubq,j=node/p_Nsubq;
+      const dfloat dx=hx/p_Nsubq,dy=hy/p_Nsubq;
+      const dfloat own=sub[e*12*p_Nsubp+node];
+      const dfloat xm=hczCapillaryPhi(e,j,i-1,neighbors,sub),xp=hczCapillaryPhi(e,j,i+1,neighbors,sub);
+      const dfloat ym=hczCapillaryPhi(e,j-1,i,neighbors,sub),yp=hczCapillaryPhi(e,j+1,i,neighbors,sub);
+      const dfloat gx=(xp-xm)/(2*dx),gy=(yp-ym)/(2*dy);
+      const dfloat lap=(xp-2*own+xm)/(dx*dx)+(yp-2*own+ym)/(dy*dy);
+      stress[(e*3+0)*p_Nsubp+node]=kappa*(own*lap+.5*(gy*gy-gx*gx));
+      stress[(e*3+1)*p_Nsubp+node]=-kappa*gx*gy;
+      stress[(e*3+2)*p_Nsubp+node]=kappa*(own*lap+.5*(gx*gx-gy*gy));
+    }
+  }
+}
+
+dfloat hczCapillaryTraction(const dlong e,const int j,const int i,
+                           const int axis,const int sign,const int component,
+                           const dlong *neighbors,const dfloat *stress){
+  const int t=axis?j:i,otherT=t+sign;
+  const dfloat own=stress[(e*3+component)*p_Nsubp+j*p_Nsubq+i];
+  dlong nb=e;int ii=i+(axis?0:sign),jj=j+(axis?sign:0);
+  if(otherT<0 || otherT>=p_Nsubq){
+    nb=neighbors[9*e+4+sign*(axis?3:1)];
+    // Neutral walls: normal traction retained, shear traction zero.
+    if(nb<0)return component==1?0.0:own;
+    if(axis)jj=otherT<0?p_Nsubq-1:0;
+    else ii=otherT<0?p_Nsubq-1:0;
+  }
+  return .5*(own+stress[(nb*3+component)*p_Nsubp+jj*p_Nsubq+ii]);
+}
+
+@kernel void bnsHczCapillarySubcellSourceQuad2D(const dlong Nelements,
+                                               @restrict const dlong *elementIds,
+                                               @restrict const dlong *neighbors,
+                                               const dfloat hx,const dfloat hy,const dfloat c,
+                                               const dfloat rhoL,const dfloat rhoH,
+                                               const dfloat phiL,const dfloat phiH,
+                                               @restrict const dfloat *sub,
+                                               @restrict const dfloat *stress,
+                                               @restrict dfloat *source){
+  for(dlong et=0;et<Nelements;++et;@outer(0)){
+    for(int node=0;node<p_Nsubp;++node;@inner(0)){
+      const dlong e=elementIds[et];const int i=node%p_Nsubq,j=node/p_Nsubq;
+      const dfloat fx=(hczCapillaryTraction(e,j,i,0,1,0,neighbors,stress)-hczCapillaryTraction(e,j,i,0,-1,0,neighbors,stress))/(hx/p_Nsubq)
+                     +(hczCapillaryTraction(e,j,i,1,1,1,neighbors,stress)-hczCapillaryTraction(e,j,i,1,-1,1,neighbors,stress))/(hy/p_Nsubq);
+      const dfloat fy=(hczCapillaryTraction(e,j,i,0,1,1,neighbors,stress)-hczCapillaryTraction(e,j,i,0,-1,1,neighbors,stress))/(hx/p_Nsubq)
+                     +(hczCapillaryTraction(e,j,i,1,1,2,neighbors,stress)-hczCapillaryTraction(e,j,i,1,-1,2,neighbors,stress))/(hy/p_Nsubq);
+      const dlong base=e*12*p_Nsubp+node;
+      const dfloat rho=rhoL+(sub[base]-phiL)*(rhoH-rhoL)/(phiH-phiL);
+      const dfloat u=sub[base+7*p_Nsubp]/(rho*c),v=sub[base+8*p_Nsubp]/(rho*c);
+      for(int k=0;k<12;++k)source[base+k*p_Nsubp]=0.0;
+      source[base+7*p_Nsubp]=c*fx;source[base+8*p_Nsubp]=c*fy;
+      source[base+9*p_Nsubp]=u*fy+v*fx;
+      source[base+10*p_Nsubp]=sqrt(2.0)*u*fx;source[base+11*p_Nsubp]=sqrt(2.0)*v*fy;
+    }
+  }
+}
+
+@kernel void bnsHczCapillarySubcellAddQuad2D(const dlong Nelements,
+                                            @restrict const dlong *elementIds,
+                                            @restrict const dfloat *source,
+                                            @restrict dfloat *rhs){
+  for(dlong et=0;et<Nelements;++et;@outer(0)){
+    for(int node=0;node<p_Nsubp;++node;@inner(0)){
+      const dlong base=elementIds[et]*12*p_Nsubp+node;
+      for(int k=7;k<12;++k)rhs[base+k*p_Nsubp]+=source[base+k*p_Nsubp];
+    }
+  }
+}

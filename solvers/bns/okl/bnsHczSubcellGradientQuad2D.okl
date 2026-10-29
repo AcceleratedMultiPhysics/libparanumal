@@ -28,7 +28,7 @@ SOFTWARE.
 // potentials: [element][psiPhi,psiRho][y subcell][x subcell].
 // gradients: [element][psiPhi_x,psiPhi_y,psiRho_x,psiRho_y][subcell].
 // neighbors[e][(dy+1)*3+dx+1] includes self and prepared potential halos.
-// x is periodic; only y-wall entries may be negative. hx/hy are positive
+// Negative x/y neighbors use copied scalar wall ghosts. hx/hy are positive
 // Cartesian element widths. All input values must be finite.
 #if p_Nfields != 12
 #error HCZ subcell gradients require twelve solution fields
@@ -53,8 +53,16 @@ SOFTWARE.
         const int i=node%p_Nsubq,j=node/p_Nsubq;
         dlong exM=e,exP=e,eyM=e,eyP=e;
         int im=i-1,ip=i+1,jm=j-1,jp=j+1;
-        if(im<0){exM=neighbors[9*e+3];im+=p_Nsubq;}
-        if(ip>=p_Nsubq){exP=neighbors[9*e+5];ip-=p_Nsubq;}
+        if(im<0){
+          exM=neighbors[9*e+3];
+          if(exM<0){exM=e;im=0;}
+          else im+=p_Nsubq;
+        }
+        if(ip>=p_Nsubq){
+          exP=neighbors[9*e+5];
+          if(exP<0){exP=e;ip=p_Nsubq-1;}
+          else ip-=p_Nsubq;
+        }
         if(jm<0){
           eyM=neighbors[9*e+1];
           if(eyM<0){eyM=e;jm=0;}

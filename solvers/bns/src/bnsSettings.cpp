@@ -35,7 +35,7 @@ bnsSettings_t::bnsSettings_t(comm_t& _comm):
   newSetting("HCZ DG BACKEND", "HOST", "HCZ backend; OCCA/VERIFY use device DG/subcell stages and require kappa=0",
              {"HOST", "OCCA", "VERIFY"});
   newSetting("HCZ RHO LIGHT", "1", "Physical light-phase density");
-  newSetting("HCZ RHO HEAVY", "19", "Physical heavy-phase density");
+  newSetting("HCZ RHO HEAVY", "3", "Physical heavy-phase density");
   newSetting("HCZ PHI LIGHT", "0.02381", "Light-phase index endpoint");
   newSetting("HCZ PHI HEAVY", "0.2508", "Heavy-phase index endpoint");
   newSetting("HCZ EOS B", "4", "Carnahan-Starling b");
@@ -49,8 +49,17 @@ bnsSettings_t::bnsSettings_t(comm_t& _comm):
              {"RT", "SLAB", "BUBBLE", "UNIFORM"});
   newSetting("HCZ Y BOUNDARY", "WALL", "Vertical kinetic boundary",
              {"WALL", "PERIODIC"});
-  newSetting("HCZ INTERFACE WIDTH", "0.03125", "Initial tanh 10-90 width");
+  newSetting("HCZ X BOUNDARY", "PERIODIC", "Horizontal kinetic boundary",
+             {"PERIODIC", "SLIP"});
+  newSetting("HCZ INTERFACE WIDTH", "0.03125", "Initial index-profile 10-90 width");
   newSetting("HCZ PERTURBATION", "0.1", "RT amplitude as fraction of width");
+  newSetting("HCZ BUBBLE RADIUS", "0", "Circle radius; 0 uses 0.2 min(Lx,Ly)");
+  newSetting("HCZ BUBBLE CENTER X", "-1", "Circle center in [0,Lx]; -1 uses Lx/2");
+  newSetting("HCZ BUBBLE CENTER Y", "-1", "Circle center in [0,Ly]; -1 uses Ly/2");
+  newSetting("HCZ BUBBLE PHASE", "HEAVY", "Phase inside the circle", {"HEAVY", "LIGHT"});
+  newSetting("HCZ BUBBLE PROFILE", "TANH", "Radial index profile", {"TANH", "COMPACT"});
+  newSetting("HCZ BUBBLE PRESSURE", "NONE", "Capillary pressure initialization; MECHANICAL requires COMPACT",
+             {"NONE", "MECHANICAL"});
   newSetting("HCZ SUBCELL WENO", "TRUE", "Candidate-triggered WENO3-Z",
              {"TRUE", "FALSE"});
   newSetting("HCZ INTERFACE SUBCELLS", "FALSE", "Seed WENO cells from the evolving index interface",

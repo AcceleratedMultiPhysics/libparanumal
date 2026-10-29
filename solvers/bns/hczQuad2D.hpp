@@ -133,7 +133,8 @@ public:
   Parameters p;
   int n, ns, nc, local, total;
   double hx, hy;
-  // Neighbor ordering: (dy+1)*3+dx+1; -1 marks a physical y wall.
+  // Neighbor ordering: (dy+1)*3+dx+1; -1 marks a physical wall.
+  // X walls are specular slip; y walls use stationary kinetic reflection.
   std::vector<std::array<int,9>> neighbor;
   Vec nodes, weights, D, I, P, A, R;
   std::function<void(Vec&,int)> exchange=[](Vec&,int){};
@@ -187,26 +188,27 @@ public:
     State a{}; for(int k=0;k<12;k++) a[k]=q[id(e,j,i,k,m)]; return a;
   }
   State sample(const Vec& q,int e,int j,int i,int m,bool kinetic=true) const {
-    int dx=0,dy=0;
-    if(i<0) {dx=-1;i+=m;} else if(i>=m) {dx=1;i-=m;}
-    if(j<0) dy=-1; else if(j>=m) dy=1;
-    int other=neighbor[e][(dy+1)*3+dx+1]; bool wall=other<0;
-    if(wall) {other=neighbor[e][3+dx+1]; j=(j<0)?-j-1:2*m-1-j;}
-    else if(dy) j-=dy*m;
+    const int dx=i<0?-1:(i>=m?1:0),dy=j<0?-1:(j>=m?1:0);
+    const bool wallX=dx && neighbor[e][4+dx]<0,wallY=dy && neighbor[e][4+3*dy]<0;
+    const int other=neighbor[e][4+(wallX?0:dx)+(wallY?0:3*dy)];
+    i=wallX?(i<0?-i-1:2*m-1-i):i-dx*m;
+    j=wallY?(j<0?-j-1:2*m-1-j):j-dy*m;
     State a=get(q,other,j,i,m);
-    if(wall && kinetic) for(int k: {1,2,7,8}) a[k]=-a[k];
+    if(wallY && kinetic) for(int k: {1,2,7,8}) a[k]=-a[k];
+    // Specular reflection at x walls: normal momentum and xy stress odd;
+    // tangential momentum and both diagonal second moments even.
+    if(wallX && kinetic) for(int k: {1,3,7,9}) a[k]=-a[k];
     return a;
   }
   double scalarSample(const Vec& q,int e,int j,int i,int m) const {
-    int dx=0,dy=0;
-    if(i<0) {dx=-1;i+=m;} else if(i>=m) {dx=1;i-=m;}
-    if(j<0) dy=-1; else if(j>=m) dy=1;
-    int other=neighbor[e][(dy+1)*3+dx+1];
-    if(other<0) {other=neighbor[e][3+dx+1]; j=std::max(0,std::min(m-1,j));}
-    else if(dy) j-=dy*m;
+    const int dx=i<0?-1:(i>=m?1:0),dy=j<0?-1:(j>=m?1:0);
+    const bool wallX=dx && neighbor[e][4+dx]<0,wallY=dy && neighbor[e][4+3*dy]<0;
+    const int other=neighbor[e][4+(wallX?0:dx)+(wallY?0:3*dy)];
+    i=wallX?std::max(0,std::min(m-1,i)):i-dx*m;
+    j=wallY?std::max(0,std::min(m-1,j)):j-dy*m;
     return q[id(other,j,i,0,m,1)];
   }
-  Vec derivative(Vec value,int axis,bool fv=false,bool oneSided=false) const {
+  Vec derivative(Vec value,int axis,bool fv=false,bool oneSided=false,bool zeroNormalFlux=false) const {
     int m=fv?ns:n; double h=axis?hy:hx;
     exchange(value,m*m);
     Vec out(size_t(total)*m*m,0);
@@ -222,7 +224,11 @@ public:
         for(int a=0;a<n;a++) d+=D[t*n+a]*value[id(e,axis?a:j,axis?i:a,0,n,1)];
         if(t==0 || t==n-1) {
           int sign=t==0?-1:1;
-          d+=sign*.5*(at(sign)-at(0))/weights[t];
+          // In the capillary divergence, prescribe grad(phi).n = 0 at
+          // physical walls. The central exterior normal component is -own.
+          const bool wall=neighbor[e][4+sign*(axis?3:1)]<0;
+          const double other=(zeroNormalFlux && wall)?-at(0):at(sign);
+          d+=sign*.5*(other-at(0))/weights[t];
         }
         d*=2/h;
       }
@@ -291,10 +297,18 @@ public:
     }
     Vec co=project(cq,nc,n,P);
     for(size_t i=0;i<rhs.size();i++) rhs[i]+=co[i];
-    addSources(q,rhs,false);
+    addSources(q,rhs,false,!p.subcell);
+    if(p.subcell && p.kappa!=0) {
+      Vec sub=project(q,n,ns,A);
+      if(!scaleSubcellIndex(sub))throw SubcellMeanError();
+      exchange(sub,ns*ns*12);
+      Vec cap(sub.size(),0);addHybridCapillarySources(sub,cap);
+      const Vec projected=project(cap,ns,n,R,true);
+      for(size_t a=0;a<rhs.size();a++)rhs[a]+=projected[a];
+    }
     return rhs;
   }
-  void addSources(const Vec& q,Vec& rhs,bool fv) const {
+  void addSources(const Vec& q,Vec& rhs,bool fv,bool includeCapillary=true) const {
     int m=fv?ns:n;
     Vec phi(size_t(total)*m*m,0), psi(phi.size(),0), rhoPsi(phi.size(),0);
     for(int e=0;e<local;e++) for(int j=0;j<m;j++) for(int i=0;i<m;i++) {
@@ -304,26 +318,64 @@ public:
     Vec px=derivative(psi,0,fv), py=derivative(psi,1,fv);
     Vec rx=derivative(rhoPsi,0,fv), ry=derivative(rhoPsi,1,fv,true);
     Vec lx(phi.size(),0), ly(phi.size(),0);
-    if(p.kappa!=0) {
-      Vec lap(phi.size(),0);
-      if(fv) {
-        exchange(phi,m*m);
-        for(int e=0;e<local;e++) for(int j=0;j<m;j++) for(int i=0;i<m;i++) {
-          size_t a=id(e,j,i,0,m,1);
-          lap[a]=(scalarSample(phi,e,j,i+1,m)-2*phi[a]+scalarSample(phi,e,j,i-1,m))/std::pow(hx/m,2)
-                +(scalarSample(phi,e,j+1,i,m)-2*phi[a]+scalarSample(phi,e,j-1,i,m))/std::pow(hy/m,2);
-        }
-      } else {
-        lap=derivative(derivative(phi,0),0);
-        Vec yy=derivative(derivative(phi,1),1);
-        for(size_t a=0;a<lap.size();a++) lap[a]+=yy[a];
-      }
-      lx=derivative(lap,0,fv); ly=derivative(lap,1,fv);
+    if(includeCapillary && p.kappa!=0 && !fv) {
+      Vec lap=derivative(derivative(phi,0),0,false,false,true);
+      Vec yy=derivative(derivative(phi,1),1,false,false,true);
+      for(size_t a=0;a<lap.size();a++) lap[a]+=yy[a];
+      lx=derivative(lap,0); ly=derivative(lap,1);
     }
     for(int e=0;e<local;e++) for(int j=0;j<m;j++) for(int i=0;i<m;i++) {
       size_t a=id(e,j,i,0,m,1);
       State src=source(get(q,e,j,i,m),p,px[a],py[a],rx[a],ry[a],p.kappa*phi[a]*lx[a],p.kappa*phi[a]*ly[a]);
       for(int k=0;k<12;k++) rhs[id(e,j,i,k,m)]+=src[k];
+    }
+    if(includeCapillary && fv)addHybridCapillarySources(q,rhs);
+  }
+  // Common auxiliary FV grid for hybrid capillarity, independent of mask.
+  // Shared central stress tractions telescope on internal/periodic faces.
+  Vec subcellCapillaryStress(const Vec& sub) const {
+    const int np=ns*ns;
+    Vec phi(size_t(total)*np),stress(size_t(total)*np*3,0);
+    for(int e=0;e<total;e++)for(int j=0;j<ns;j++)for(int i=0;i<ns;i++)
+      phi[id(e,j,i,0,ns,1)]=sub[id(e,j,i,0,ns)];
+    const double dx=hx/ns,dy=hy/ns;
+    for(int e=0;e<local;e++)for(int j=0;j<ns;j++)for(int i=0;i<ns;i++) {
+      const double own=phi[id(e,j,i,0,ns,1)];
+      const double xm=scalarSample(phi,e,j,i-1,ns),xp=scalarSample(phi,e,j,i+1,ns);
+      const double ym=scalarSample(phi,e,j-1,i,ns),yp=scalarSample(phi,e,j+1,i,ns);
+      const double gx=(xp-xm)/(2*dx),gy=(yp-ym)/(2*dy);
+      const double lap=(xp-2*own+xm)/(dx*dx)+(yp-2*own+ym)/(dy*dy);
+      stress[id(e,j,i,0,ns,3)]=p.kappa*(own*lap+.5*(gy*gy-gx*gx));
+      stress[id(e,j,i,1,ns,3)]=-p.kappa*gx*gy;
+      stress[id(e,j,i,2,ns,3)]=p.kappa*(own*lap+.5*(gx*gx-gy*gy));
+    }
+    exchange(stress,3*np);return stress;
+  }
+  void addHybridCapillarySources(const Vec& sub,Vec& rhs) const {
+    if(p.kappa==0)return;
+    const auto stress=subcellCapillaryStress(sub);
+    for(int e=0;e<local;e++)for(int j=0;j<ns;j++)for(int i=0;i<ns;i++) {
+      auto face=[&](int axis,int sign,int component) {
+        const int t=axis?j:i,otherT=t+sign;
+        const double own=stress[id(e,j,i,component,ns,3)];
+        int nb=e,ii=i+(axis?0:sign),jj=j+(axis?sign:0);
+        if(otherT<0 || otherT>=ns) {
+          nb=neighbor[e][4+sign*(axis?3:1)];
+          // Neutral index walls: retain normal traction, zero shear.
+          if(nb<0)return component==1?0.:own;
+          if(axis)jj=otherT<0?ns-1:0;else ii=otherT<0?ns-1:0;
+        }
+        return .5*(own+stress[id(nb,jj,ii,component,ns,3)]);
+      };
+      const double fx=(face(0,1,0)-face(0,-1,0))/(hx/ns)
+                     +(face(1,1,1)-face(1,-1,1))/(hy/ns);
+      const double fy=(face(0,1,1)-face(0,-1,1))/(hx/ns)
+                     +(face(1,1,2)-face(1,-1,2))/(hy/ns);
+      const auto s=get(sub,e,j,i,ns);
+      const double u=s[7]/(p.rho(s[0])*p.c),v=s[8]/(p.rho(s[0])*p.c);
+      rhs[id(e,j,i,7,ns)]+=p.c*fx;rhs[id(e,j,i,8,ns)]+=p.c*fy;
+      rhs[id(e,j,i,9,ns)]+=u*fy+v*fx;
+      rhs[id(e,j,i,10,ns)]+=sq2*u*fx;rhs[id(e,j,i,11,ns)]+=sq2*v*fy;
     }
   }
   double blend(double v0,double v1,double b0,double b1,double d0) const {
@@ -407,7 +459,8 @@ public:
           -(face(e,1,i,j+1)[k]-face(e,1,i,j)[k])/(hy/ns);
       }
     }
-    addSources(sub,fv,true);
+    addSources(sub,fv,true,false);
+    addHybridCapillarySources(sub,fv);
     Vec reconstructed=project(fv,ns,n,R,true), out=dgRhs;
     for(int e=0;e<local;e++) {
       if(mask[e]) {

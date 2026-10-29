@@ -95,7 +95,13 @@ SOFTWARE.
 #if p_HCZ_MASKED_RECONSTRUCT
             if(mask[elementIds[et]])
 #endif
-              dgRhs[(elementIds[et]*12+k)*p_Np+j*p_Nq+i]=s_dg[k][j][i]+s_shift[k];
+              dgRhs[(elementIds[et]*12+k)*p_Np+j*p_Nq+i]
+#if p_HCZ_ADD_RECONSTRUCT
+                +=
+#else
+                =
+#endif
+                  s_dg[k][j][i]+s_shift[k];
         }
       }
     }
