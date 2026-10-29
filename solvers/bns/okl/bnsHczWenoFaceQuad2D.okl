@@ -29,7 +29,8 @@ SOFTWARE.
 // faces: [element][axis][12 moments][tangent subcell][normal face].
 // neighbors: [owned element][9], ordered (dy+1)*3+dx+1, including self.
 // All referenced owned/halo subcells must be prepared before this call.
-// Negative neighbors mark physical walls: x specular slip, y stationary.
+// Negative neighbors mark physical walls: x specular slip, y stationary
+// (or y specular slip when p_HCZ_Y_SLIP).
 #if p_Nfields != 12
 #error HCZ WENO face fluxes require twelve fields
 #endif
@@ -38,6 +39,9 @@ SOFTWARE.
 #endif
 #ifndef p_HCZ_CHARACTERISTIC_WENO
 #define p_HCZ_CHARACTERISTIC_WENO 1
+#endif
+#ifndef p_HCZ_Y_SLIP
+#define p_HCZ_Y_SLIP 0
 #endif
 #define p_Nsubq (2*p_Nq-1)
 #define p_Nsubp (p_Nsubq*p_Nsubq)
@@ -86,7 +90,11 @@ dfloat hczWeno3zBlend(const dfloat v0,const dfloat v1,
           j=wallY?(j<0?-j-1:2*p_Nsubq-1-j):j-dy*p_Nsubq;
           for(int k=0;k<12;++k){
             dfloat value=sub[(other*12+k)*p_Nsubp+j*p_Nsubq+i];
+#if p_HCZ_Y_SLIP
+            if(wallY && (k==2 || k==3 || k==8 || k==9))value=-value;
+#else
             if(wallY && (k==1 || k==2 || k==7 || k==8))value=-value;
+#endif
             if(wallX && (k==1 || k==3 || k==7 || k==9))value=-value;
             q[t][k]=value;
           }

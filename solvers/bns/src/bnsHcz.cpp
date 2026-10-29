@@ -18,7 +18,8 @@ public:
   std::unique_ptr<hcz::QuadOperator> op;
   int nx=0,ny=0,frame=0;
   double width=0,height=0,interfaceWidth=0,amplitude=0,initialMass=0,initialIndex=0;
-  bool periodicY=false,periodicX=true;
+  bool periodicY=false,periodicX=true,slipY=false;
+  int vtuEvery=1;
   double bubbleRadius=0,bubbleX=0,bubbleY=0;
   bool lightBubble=false;
   bool compactCircle=false,mechanicalBubble=false;
@@ -104,7 +105,10 @@ public:
     m.settings.getSetting("BOX DIMX",width); m.settings.getSetting("BOX DIMY",height);
     LIBP_ABORT("Invalid HCZ box dimensions",nx<1 || ny<1 || width<=0 || height<=0);
     periodicY=b.settings.compareSetting("HCZ Y BOUNDARY","PERIODIC");
+    slipY=b.settings.compareSetting("HCZ Y BOUNDARY","SLIP");
     periodicX=b.settings.compareSetting("HCZ X BOUNDARY","PERIODIC");
+    b.settings.getSetting("HCZ VTU EVERY",vtuEvery);
+    LIBP_ABORT("HCZ VTU EVERY must be nonnegative",vtuEvery<0);
     b.settings.getSetting("HCZ INITIAL CONDITION",initial);
     LIBP_ABORT("HCZ RT initialization requires y walls",initial=="RT" && periodicY);
     double hx=width/nx,hy=height/ny;
@@ -176,6 +180,7 @@ public:
     p.subcell=b.settings.compareSetting("HCZ SUBCELL WENO","TRUE");
     p.interfaceSubcells=b.settings.compareSetting("HCZ INTERFACE SUBCELLS","TRUE");
     p.interfaceThreshold=setting("HCZ INTERFACE THRESHOLD");
+    p.slipY=slipY;
     LIBP_ABORT("HCZ INTERFACE SUBCELLS requires HCZ SUBCELL WENO = TRUE",p.interfaceSubcells && !p.subcell);
     LIBP_ABORT("HCZ INTERFACE THRESHOLD must be finite and strictly between 0 and 0.5",
                !std::isfinite(p.interfaceThreshold) || p.interfaceThreshold<=0 || p.interfaceThreshold>=.5);
@@ -256,7 +261,7 @@ public:
         const int axis=(face==1 || face==3)?0:1;
         const int sign=(face==0 || face==3)?-1:1;
         const int nb=op->neighbor[e][4+sign*(axis?3:1)];
-        boundary[e*4+face]=nb<0?(axis?1:2):0;
+        boundary[e*4+face]=nb<0?(axis?(slipY?3:1):2):0;
         for(int t=0;t<m.Nfp;t++) {
           const int i=axis?t:(sign<0?0:m.Nq-1);
           const int j=axis?(sign<0?0:m.Nq-1):t;
@@ -346,6 +351,7 @@ public:
     projectSubcellKernel=build("bnsHczSubcellQuad2D","bnsHczProjectSubcellQuad2D");
     scaleSubcellKernel=build("bnsHczSubcellQuad2D","bnsHczScaleSubcellQuad2D");
     props["defines/p_HCZ_CHARACTERISTIC_WENO"]=op->p.characteristicWeno?1:0;
+    props["defines/p_HCZ_Y_SLIP"]=op->p.slipY?1:0;
     wenoFaceKernel=build("bnsHczWenoFaceQuad2D","bnsHczWenoFaceQuad2D");
     subcellRhsKernel=build("bnsHczSubcellRhsQuad2D","bnsHczSubcellRhsQuad2D");
     subcellGradientKernel=build("bnsHczSubcellGradientQuad2D","bnsHczSubcellGradientQuad2D");
@@ -892,6 +898,59 @@ public:
     }
     auto integrals=integrate(q);initialIndex=integrals[0];initialMass=integrals[1];
   }
+  // Index level alpha=(phi-phiL)/(phiH-phiL)=1/2 along the vertical line at
+  // reference coordinate rx of element e. Updates the highest/lowest
+  // crossing height using the element's degree-N interpolant in y.
+  void lineCrossings(const hcz::Vec& q,int e,double rx,double& high,double& low) const {
+    const int n=op->n;const auto& p=op->p;const auto& r=op->nodes;
+    auto lagrange=[&](int i,double x) {
+      double a=1;for(int j=0;j<n;j++)if(j!=i)a*=(x-r[j])/(r[i]-r[j]);return a;
+    };
+    hcz::Vec v(n,0),wx(n);
+    for(int i=0;i<n;i++)wx[i]=lagrange(i,rx);
+    for(int j=0;j<n;j++)for(int i=0;i<n;i++)
+      v[j]+=wx[i]*((q[op->id(e,j,i,0,n)]-p.phiL)/(p.phiH-p.phiL)-.5);
+    auto f=[&](double y) {double s=0;for(int j=0;j<n;j++)s+=lagrange(j,y)*v[j];return s;};
+    const int samples=8*n;const double hy=op->hy;const int ey=gids[e]/nx;
+    double a=-1,fa=f(a);
+    for(int s=1;s<=samples;s++) {
+      double c=-1+2.*s/samples,fc=f(c);
+      if(fa==0 || fa*fc<0) {
+        double lo=a,hi=c,flo=fa;
+        if(fa!=0)for(int it=0;it<60;it++) {
+          const double mid=.5*(lo+hi),fm=f(mid);
+          if(flo*fm<=0)hi=mid;else{lo=mid;flo=fm;}
+        }
+        const double root=fa==0?a:.5*(lo+hi),y=(ey+.5+.5*root)*hy;
+        high=std::max(high,y);low=std::min(low,y);
+      }
+      a=c;fa=fc;
+    }
+    if(fa==0) {const double y=(ey+1)*hy;high=std::max(high,y);low=std::min(low,y);}
+  }
+  // RT tips relative to the mean interface y=H/2: bubble on x=0 (highest
+  // crossing), spike on x=W/2 (lowest crossing), and the domain-wide
+  // highest/lowest crossings over all GLL node columns.
+  std::array<double,4> rtTips(const hcz::Vec& q) const {
+    const double inf=std::numeric_limits<double>::infinity();
+    double local[4]={-inf,-inf,-inf,-inf}; // maxima of {bubble,-spike,top,-bottom}
+    auto lineAt=[&](double x0,double& high,double& low) {
+      const int ex0=std::min(int(x0/op->hx),nx-1);
+      const double rx=std::max(-1.,std::min(1.,2*(x0/op->hx-ex0)-1));
+      for(int e=0;e<op->local;e++)if(gids[e]%nx==ex0)lineCrossings(q,e,rx,high,low);
+    };
+    double high=-inf,low=inf;
+    lineAt(0,high,low);local[0]=high;
+    high=-inf;low=inf;
+    lineAt(.5*width,high,low);local[1]=-low;
+    high=-inf;low=inf;
+    for(int e=0;e<op->local;e++)for(int i=0;i<op->n;i++)lineCrossings(q,e,op->nodes[i],high,low);
+    local[2]=high;local[3]=-low;
+    double global[4];
+    MPI_Allreduce(local,global,4,MPI_DOUBLE,MPI_MAX,b.comm.comm());
+    const double mid=.5*height;
+    return {global[0]-mid,-global[1]-mid,global[2]-mid,-global[3]-mid};
+  }
   std::array<double,2> integrate(const hcz::Vec& q) {
     double local[2]={},global[2]={};
     for(int e=0;e<op->local;e++)for(int j=0;j<op->n;j++)for(int i=0;i<op->n;i++) {
@@ -910,6 +969,24 @@ public:
     MPI_Allreduce(&speed,&globalSpeed,1,MPI_DOUBLE,MPI_MAX,b.comm.comm());
     int troubled;MPI_Allreduce(&op->lastTroubled,&troubled,1,MPI_INT,MPI_SUM,b.comm.comm());
     std::string prefix;b.settings.getSetting("OUTPUT FILE NAME",prefix);
+    if(initial=="RT") {
+      const auto tips=rtTips(q);
+      const auto& p=op->p;
+      const double atwood=(p.rhoH-p.rhoL)/(p.rhoH+p.rhoL);
+      // Reference scalings: sqrt(g/W) (HCZ 1999) and sqrt(At g/W) (Ding 2007).
+      const double tg=time*std::sqrt(p.gravity/width),tAt=time*std::sqrt(atwood*p.gravity/width);
+      if(b.comm.rank()==0) {
+        std::cout<<std::setprecision(12)<<"HCZ RT t="<<time<<" t*="<<tg<<" t*At="<<tAt
+                 <<" bubble="<<tips[0]<<" spike="<<tips[1]<<" top="<<tips[2]<<" bottom="<<tips[3]<<"\n";
+        if(b.settings.compareSetting("OUTPUT TO FILE","TRUE")) {
+          std::ofstream csv(prefix+"_rt_tips.csv",frame==0?std::ios::out:std::ios::app);
+          LIBP_ABORT("Cannot open HCZ RT tip diagnostics",!csv);
+          if(frame==0)csv<<"time,t_star_g,t_star_At,bubble_y,spike_y,top_y,bottom_y\n";
+          csv<<std::setprecision(17)<<time<<","<<tg<<","<<tAt<<","<<tips[0]<<","<<tips[1]
+             <<","<<tips[2]<<","<<tips[3]<<"\n";
+        }
+      }
+    }
     if(initial=="BUBBLE" && b.settings.compareSetting("OUTPUT TO FILE","TRUE")) {
       // Unclipped diffuse phase fraction: its integral follows conserved phi.
       // Reporting uses the same GLL quadrature as the conservation diagnostic.
@@ -946,7 +1023,7 @@ public:
           <<","<<globalLo<<","<<globalHi<<","<<globalSpeed<<","<<troubled<<","<<op->candidateChecks<<","<<op->recomputations<<","<<op->maxRecomputePasses<<"\n";
       }
     }
-    if(b.settings.compareSetting("OUTPUT TO FILE","TRUE")) {
+    if(b.settings.compareSetting("OUTPUT TO FILE","TRUE") && vtuEvery>0 && frame%vtuEvery==0) {
       // Reporting-only transfer: never infer this mask by redetecting q.
       // Initial data has not undergone an update, so its mask is zero.
       memory<int> active(op->local,0);
@@ -1117,7 +1194,14 @@ void bns_t::HczRun() {
   if(comm.rank()==0)std::cout<<"HCZ dt="<<std::setprecision(17)<<dt<<"\n";
   if(hcz->useSark && comm.rank()==0)
     std::cout<<"HCZ SARK4: max_dt="<<hcz->sarkDtMax<<" atol="<<hcz->sarkAtol<<" rtol="<<hcz->sarkRtol<<"\n";
+  platform.device.finish();comm.Barrier();
+  const double wallStart=MPI_Wtime();
   timeStepper.Run(*this,o_q,start,finish);
+  platform.device.finish();comm.Barrier();
+  const double wallTime=MPI_Wtime()-wallStart;
+  if(comm.rank()==0)
+    std::cout<<"HCZ wall time="<<std::setprecision(6)<<wallTime<<" s (time loop incl. reports), ranks="<<comm.size()
+             <<", elements="<<hcz->nx*hcz->ny<<", nodes/element="<<mesh.Np<<"\n";
   if(hcz->verifyOcca && comm.rank()==0)
     std::cout<<"HCZ OCCA verification: rhs_checks="<<hcz->rhsChecks
              <<" max_error="<<hcz->maxRhsError

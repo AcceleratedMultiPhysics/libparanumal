@@ -28,6 +28,7 @@ struct Parameters {
   bool subcell=true;
   bool characteristicWeno=true;
   bool interfaceSubcells=false;
+  bool slipY=false;
   double interfaceThreshold=.01;
   double rho(double phi) const { return rhoL+(phi-phiL)*(rhoH-rhoL)/(phiH-phiL); }
   double cs(double phi) const {
@@ -134,7 +135,8 @@ public:
   int n, ns, nc, local, total;
   double hx, hy;
   // Neighbor ordering: (dy+1)*3+dx+1; -1 marks a physical wall.
-  // X walls are specular slip; y walls use stationary kinetic reflection.
+  // X walls are specular slip; y walls use stationary kinetic reflection
+  // (or specular slip when p.slipY).
   std::vector<std::array<int,9>> neighbor;
   Vec nodes, weights, D, I, P, A, R;
   std::function<void(Vec&,int)> exchange=[](Vec&,int){};
@@ -194,7 +196,10 @@ public:
     i=wallX?(i<0?-i-1:2*m-1-i):i-dx*m;
     j=wallY?(j<0?-j-1:2*m-1-j):j-dy*m;
     State a=get(q,other,j,i,m);
-    if(wallY && kinetic) for(int k: {1,2,7,8}) a[k]=-a[k];
+    // Y walls: stationary kinetic reflection, or specular slip with normal
+    // momentum and xy stress odd.
+    if(wallY && kinetic && !p.slipY) for(int k: {1,2,7,8}) a[k]=-a[k];
+    if(wallY && kinetic && p.slipY) for(int k: {2,3,8,9}) a[k]=-a[k];
     // Specular reflection at x walls: normal momentum and xy stress odd;
     // tangential momentum and both diagonal second moments even.
     if(wallX && kinetic) for(int k: {1,3,7,9}) a[k]=-a[k];

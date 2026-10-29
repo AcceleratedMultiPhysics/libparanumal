@@ -47,8 +47,8 @@ bnsSettings_t::bnsSettings_t(comm_t& _comm):
   newSetting("HCZ GRAVITY", "0.04", "Downward gravitational acceleration");
   newSetting("HCZ INITIAL CONDITION", "RT", "HCZ initial geometry",
              {"RT", "SLAB", "BUBBLE", "UNIFORM"});
-  newSetting("HCZ Y BOUNDARY", "WALL", "Vertical kinetic boundary",
-             {"WALL", "PERIODIC"});
+  newSetting("HCZ Y BOUNDARY", "WALL", "Vertical kinetic boundary; SLIP is a y-normal specular wall",
+             {"WALL", "SLIP", "PERIODIC"});
   newSetting("HCZ X BOUNDARY", "PERIODIC", "Horizontal kinetic boundary",
              {"PERIODIC", "SLIP"});
   newSetting("HCZ INTERFACE WIDTH", "0.03125", "Initial index-profile 10-90 width");
@@ -76,6 +76,7 @@ bnsSettings_t::bnsSettings_t(comm_t& _comm):
   newSetting("HCZ WENO EPSILON", "1e-12", "WENO-Z epsilon");
   newSetting("HCZ COLLISION CFL", "0.2", "Explicit BGK time-step factor");
   newSetting("HCZ SUBCELL CFL", "0.18", "Subcell transport time-step factor");
+  newSetting("HCZ VTU EVERY", "1", "Write a VTU file every N reports; 0 writes none (CSV diagnostics are unaffected)");
 
   newSetting("DATA FILE",
              "data/bnsTalorVortex2D.h",
