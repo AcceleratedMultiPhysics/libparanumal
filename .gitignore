@@ -36,3 +36,18 @@ test/*.rc
 
 .vimrc
 .occa/
+
+# Local-only material kept outside the repo (moved to ../M_BNS_Docs)
+.vscode/
+.claude/
+CLAUDE.md
+**/__pycache__/
+solvers/bns/*.py
+solvers/bns/*.csv
+solvers/bns/*.json
+solvers/bns/diagnostics/
+solvers/bns/static_bubble_mpl/
+solvers/bns/README_HCZ.md
+solvers/bns/HCZ_*.md
+test/hcz*
+test/testHcz*.py
