@@ -23,6 +23,9 @@ public:
   double bubbleRadius=0,bubbleX=0,bubbleY=0;
   bool lightBubble=false;
   bool compactCircle=false,mechanicalBubble=false;
+  double khTop=0,khBottom=0,khAmplitude=0,khShearWidth=0;
+  int khWaves=1;
+  bool khDisplacement=false;
   hcz::BubblePressure bubblePressure;
   std::string initial;
   std::string dgBackend;
@@ -111,6 +114,18 @@ public:
     LIBP_ABORT("HCZ VTU EVERY must be nonnegative",vtuEvery<0);
     b.settings.getSetting("HCZ INITIAL CONDITION",initial);
     LIBP_ABORT("HCZ RT initialization requires y walls",initial=="RT" && periodicY);
+    LIBP_ABORT("HCZ KH initialization requires y walls",initial=="KH" && periodicY);
+    if(initial=="KH") {
+      khTop=setting("HCZ KH VELOCITY TOP");khBottom=setting("HCZ KH VELOCITY BOTTOM");
+      khAmplitude=setting("HCZ KH AMPLITUDE");
+      khShearWidth=setting("HCZ KH SHEAR WIDTH");
+      LIBP_ABORT("HCZ KH SHEAR WIDTH must be finite and nonnegative",!std::isfinite(khShearWidth) || khShearWidth<0);
+      if(khShearWidth==0)khShearWidth=setting("HCZ INTERFACE WIDTH");
+      b.settings.getSetting("HCZ KH WAVES",khWaves);
+      khDisplacement=b.settings.compareSetting("HCZ KH PERTURBATION","DISPLACEMENT");
+      LIBP_ABORT("Invalid HCZ KH parameters",!std::isfinite(khTop) || !std::isfinite(khBottom) ||
+                 !std::isfinite(khAmplitude) || khAmplitude<0 || khWaves<1);
+    }
     double hx=width/nx,hy=height/ny;
     int count=m.Nelements,size=b.comm.size();
     std::vector<int> counts(size),disp;
@@ -851,10 +866,32 @@ public:
     for(int e=0;e<op->local;e++) for(int a=0;a<np;a++) for(int k=0;k<12;k++) host[(e*12+k)*np+a]=input[(size_t(e)*np+a)*12+k];
     output.copyFrom(host);
   }
+  // KH (Guo et al. 2024): heavy layer below y = H/2 [+ A0 sin(k x)], so the
+  // returned slope-adjusted distance is positive below the interface.
+  double khDistance(double x,double y) const {
+    const double wave=2*M_PI*khWaves/width;
+    if(!khDisplacement)return height/2-y;
+    const double slope=khAmplitude*wave*std::cos(wave*x);
+    return (height/2+khAmplitude*std::sin(wave*x)-y)/std::sqrt(1+slope*slope);
+  }
+  // Base shear u = ±U with the index profile's tanh shape and a 10-90 width
+  // khShearWidth. The VELOCITY disturbance follows Guo et al. Eq. (31) with
+  // the jump smoothed: u -= sign(dU) (du/2) T e^{-|y-H/2|}, v = dv sin(k x) e^{-|y-H/2|}.
+  std::array<double,2> khVelocity(double x,double y) const {
+    const double T=std::tanh(-khDistance(x,y)*2*std::atanh(.8)/khShearWidth);
+    double u=.5*(khTop+khBottom)+.5*(khTop-khBottom)*T,v=0;
+    if(!khDisplacement) {
+      const double decay=std::exp(-std::abs(y-height/2)),wave=2*M_PI*khWaves/width;
+      u-=(khTop>=khBottom?1:-1)*.5*khAmplitude*T*decay;
+      v=khAmplitude*std::sin(wave*x)*decay;
+    }
+    return {u,v};
+  }
   double phi(double x,double y) const {
     auto& p=op->p;double d=0;
     if(initial=="UNIFORM")return p.phiL;
-    if(initial=="RT") {
+    if(initial=="KH")d=khDistance(x,y);
+    else if(initial=="RT") {
       double wave=2*M_PI/width, slope=-amplitude*width*wave*std::sin(wave*x);
       d=(y-height/2-amplitude*width*std::cos(wave*x))/std::sqrt(1+slope*slope);
     } else if(initial=="SLAB") d=.2*width-std::abs(x-width/2);
@@ -886,6 +923,15 @@ public:
         int yid=ey*(op->n-1)+j;
         q[op->id(e,j,i,0,op->n)]=phi(x,ys[yid]);q[op->id(e,j,i,6,op->n)]=pressure[yid];
         if(mechanicalBubble)q[op->id(e,j,i,6,op->n)]+=op->p.kappa*bubblePressure.value(std::hypot(x-bubbleX,ys[yid]-bubbleY));
+        if(initial=="KH") {
+          // Moving start: all twelve moments at their BGK equilibrium.
+          const auto uv=khVelocity(x,ys[yid]);
+          hcz::State s=op->get(q,e,j,i,op->n);
+          const double rho=op->p.rho(s[0]);
+          s[7]=rho*op->p.c*uv[0];s[8]=rho*op->p.c*uv[1];
+          s=hcz::equilibrium(s,op->p);
+          for(int k=0;k<12;k++)q[op->id(e,j,i,k,op->n)]=s[k];
+        }
       }
     }
     LIBP_ABORT("HCZ initial profile has nonphysical nodal/cubature values; resolve or widen the interface",!op->admissible(q));
@@ -928,28 +974,37 @@ public:
     }
     if(fa==0) {const double y=(ey+1)*hy;high=std::max(high,y);low=std::min(low,y);}
   }
-  // RT tips relative to the mean interface y=H/2: bubble on x=0 (highest
-  // crossing), spike on x=W/2 (lowest crossing), and the domain-wide
-  // highest/lowest crossings over all GLL node columns.
-  std::array<double,4> rtTips(const hcz::Vec& q) const {
+  // RT tips relative to the mean interface y=H/2, from crossings on all GLL
+  // node columns: bubble = highest crossing in the bubble half |x|<W/4
+  // (periodic), spike = lowest crossing in the spike half |x-W/2|<W/4,
+  // domain-wide highest/lowest crossings, and the on-axis bubble (x=0,
+  // highest) and spike (x=W/2, lowest) crossings. The on-axis values drop
+  // below the front once shoulder roll-ups carry heavy fluid across the axis.
+  std::array<double,6> rtTips(const hcz::Vec& q) const {
     const double inf=std::numeric_limits<double>::infinity();
-    double local[4]={-inf,-inf,-inf,-inf}; // maxima of {bubble,-spike,top,-bottom}
+    // maxima of {bubble,-spike,top,-bottom,bubbleAxis,-spikeAxis}
+    double local[6]={-inf,-inf,-inf,-inf,-inf,-inf};
     auto lineAt=[&](double x0,double& high,double& low) {
       const int ex0=std::min(int(x0/op->hx),nx-1);
       const double rx=std::max(-1.,std::min(1.,2*(x0/op->hx-ex0)-1));
       for(int e=0;e<op->local;e++)if(gids[e]%nx==ex0)lineCrossings(q,e,rx,high,low);
     };
     double high=-inf,low=inf;
-    lineAt(0,high,low);local[0]=high;
+    lineAt(0,high,low);local[4]=high;
     high=-inf;low=inf;
-    lineAt(.5*width,high,low);local[1]=-low;
-    high=-inf;low=inf;
-    for(int e=0;e<op->local;e++)for(int i=0;i<op->n;i++)lineCrossings(q,e,op->nodes[i],high,low);
-    local[2]=high;local[3]=-low;
-    double global[4];
-    MPI_Allreduce(local,global,4,MPI_DOUBLE,MPI_MAX,b.comm.comm());
+    lineAt(.5*width,high,low);local[5]=-low;
+    for(int e=0;e<op->local;e++)for(int i=0;i<op->n;i++) {
+      high=-inf;low=inf;
+      lineCrossings(q,e,op->nodes[i],high,low);
+      const double x=(gids[e]%nx+.5+.5*op->nodes[i])*op->hx;
+      const bool bubbleHalf=std::min(x,width-x)<.25*width;
+      if(bubbleHalf)local[0]=std::max(local[0],high);else local[1]=std::max(local[1],-low);
+      local[2]=std::max(local[2],high);local[3]=std::max(local[3],-low);
+    }
+    double global[6];
+    MPI_Allreduce(local,global,6,MPI_DOUBLE,MPI_MAX,b.comm.comm());
     const double mid=.5*height;
-    return {global[0]-mid,-global[1]-mid,global[2]-mid,-global[3]-mid};
+    return {global[0]-mid,-global[1]-mid,global[2]-mid,-global[3]-mid,global[4]-mid,-global[5]-mid};
   }
   std::array<double,2> integrate(const hcz::Vec& q) {
     double local[2]={},global[2]={};
@@ -981,9 +1036,34 @@ public:
         if(b.settings.compareSetting("OUTPUT TO FILE","TRUE")) {
           std::ofstream csv(prefix+"_rt_tips.csv",frame==0?std::ios::out:std::ios::app);
           LIBP_ABORT("Cannot open HCZ RT tip diagnostics",!csv);
-          if(frame==0)csv<<"time,t_star_g,t_star_At,bubble_y,spike_y,top_y,bottom_y\n";
+          if(frame==0)csv<<"time,t_star_g,t_star_At,bubble_y,spike_y,top_y,bottom_y,bubble_axis_y,spike_axis_y\n";
           csv<<std::setprecision(17)<<time<<","<<tg<<","<<tAt<<","<<tips[0]<<","<<tips[1]
-             <<","<<tips[2]<<","<<tips[3]<<"\n";
+             <<","<<tips[2]<<","<<tips[3]<<","<<tips[4]<<","<<tips[5]<<"\n";
+        }
+      }
+    }
+    if(initial=="KH") {
+      // Interface extent relative to y=H/2 (top = billow height of the lower
+      // fluid) and vertical kinetic energy 0.5*int(rho v^2), whose linear-stage
+      // growth rate is twice the KH amplitude growth rate.
+      const auto tips=rtTips(q);
+      double localKe=0,ke=0;
+      for(int e=0;e<op->local;e++)for(int j=0;j<op->n;j++)for(int i=0;i<op->n;i++) {
+        const auto s=op->get(q,e,j,i,op->n);const double rho=op->p.rho(s[0]);
+        const double v=s[8]/(rho*op->p.c);
+        localKe+=.5*rho*v*v*.25*op->hx*op->hy*op->weights[i]*op->weights[j];
+      }
+      MPI_Allreduce(&localKe,&ke,1,MPI_DOUBLE,MPI_SUM,b.comm.comm());
+      const double tStar=time*std::abs(khTop-khBottom)/height;
+      if(b.comm.rank()==0) {
+        std::cout<<std::setprecision(12)<<"HCZ KH t="<<time<<" t*="<<tStar<<" amplitude="<<.5*(tips[2]-tips[3])
+                 <<" billow="<<tips[2]<<" bottom="<<tips[3]<<" ke_v="<<ke<<"\n";
+        if(b.settings.compareSetting("OUTPUT TO FILE","TRUE")) {
+          std::ofstream csv(prefix+"_kh_interface.csv",frame==0?std::ios::out:std::ios::app);
+          LIBP_ABORT("Cannot open HCZ KH interface diagnostics",!csv);
+          if(frame==0)csv<<"time,t_star,amplitude,billow_height,bottom_y,ke_vertical\n";
+          csv<<std::setprecision(17)<<time<<","<<tStar<<","<<.5*(tips[2]-tips[3])<<","<<tips[2]
+             <<","<<tips[3]<<","<<ke<<"\n";
         }
       }
     }

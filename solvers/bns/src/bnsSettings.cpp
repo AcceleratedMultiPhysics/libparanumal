@@ -46,7 +46,14 @@ bnsSettings_t::bnsSettings_t(comm_t& _comm):
   newSetting("HCZ KAPPA", "0", "Index capillarity coefficient");
   newSetting("HCZ GRAVITY", "0.04", "Downward gravitational acceleration");
   newSetting("HCZ INITIAL CONDITION", "RT", "HCZ initial geometry",
-             {"RT", "SLAB", "BUBBLE", "UNIFORM"});
+             {"RT", "SLAB", "BUBBLE", "UNIFORM", "KH"});
+  newSetting("HCZ KH VELOCITY TOP", "0.1", "KH: x velocity of the upper (light) layer");
+  newSetting("HCZ KH VELOCITY BOTTOM", "-0.1", "KH: x velocity of the lower (heavy) layer");
+  newSetting("HCZ KH PERTURBATION", "VELOCITY", "KH: velocity disturbance (Guo et al. 2024 Eq. 31) or interface displacement (Eq. 19)",
+             {"VELOCITY", "DISPLACEMENT"});
+  newSetting("HCZ KH AMPLITUDE", "0.006", "KH: disturbance amplitude; VELOCITY: du=dv (velocity units), DISPLACEMENT: A0 (length units)");
+  newSetting("HCZ KH WAVES", "1", "KH: number of disturbance wavelengths across the box width");
+  newSetting("HCZ KH SHEAR WIDTH", "0", "KH: 10-90 width of the tanh velocity jump; 0 uses HCZ INTERFACE WIDTH");
   newSetting("HCZ Y BOUNDARY", "WALL", "Vertical kinetic boundary; SLIP is a y-normal specular wall",
              {"WALL", "SLIP", "PERIODIC"});
   newSetting("HCZ X BOUNDARY", "PERIODIC", "Horizontal kinetic boundary",
